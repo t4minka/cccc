@@ -51,13 +51,9 @@ const static int ccml_type_sizes[CCML_TYPE_MAX] = {
 };
 
 typedef enum ccml_buff {
-    // default buffer
     CCML_BUFF_NONE,
-    // only exist as intermediary scalar values in compute kernels
     CCML_BUFF_INTR,
-    // dedicated buffer for tensors whose data is loaded from memory
     CCML_BUFF_LOAD,
-    // dedicated buffer for tensors whose data is saved into memory
     CCML_BUFF_SAVE
 } ccml_buff;
 
@@ -577,59 +573,6 @@ static void ccml_hashmap_set(ccml_hashmap * map, void * key, int value) {
 //  ╚═╝╚═╝╚═╝  ╚═╝╚═╝
 //
 
-// intermediary representation
-
-static const char * ccml_oper_to_string(ccml_oper oper) {
-    switch (oper) {
-        case CCML_OPER_LOG:
-            return "log";
-        case CCML_OPER_EXP:
-            return "exp";
-        case CCML_OPER_SIN:
-            return "sin";
-        case CCML_OPER_REC:
-            return "1/";
-        case CCML_OPER_SQRT:
-            return "sqrt";
-        case CCML_OPER_ADD:
-            return "+";
-        case CCML_OPER_MUL:
-            return "*";
-        default:
-            assert(false && "no meaningful conversion to string exists");
-    }
-}
-
-static const char * ccml_type_to_string(ccml_type type) {
-    switch (type) {
-        case CCML_TYPE_FP16:
-            return "fp16";
-        case CCML_TYPE_FP32:
-            return "fp32";
-        case CCML_TYPE_FP64:
-            return "fp64";
-        default:
-            assert(false && "unknown variant of ccml_type");
-    }
-}
-
-// super unsafe i think?
-static void ccml_find_and_replace(char * string, const char * needle, const char * replacement) {
-    char * haystack = string;
-    char * result = haystack;
-
-    while ((result = strstr(result, needle)) != NULL) {
-        size_t position = result - haystack;
-        size_t length = strlen(needle);
-
-        memmove(haystack + position + strlen(replacement), haystack + position + length,
-                strlen(haystack + position + length) + 1);
-        memcpy(haystack + position, replacement, strlen(replacement));
-
-        result += strlen(replacement);
-    }
-}
-
 // both reduction and broadcasting index functions look terrible, there has to be a cleaner
 // and concise way to express this
 
@@ -690,7 +633,6 @@ typedef struct ccml_graph {
     int n_nodes;
     ccml_tensor * nodes[CCML_NODE_MAX];
     ccml_hashmap * map;
-    char ir[CCML_NODE_MAX * CCML_CHAR_MAX];
 } ccml_graph;
 
 static void ccml_graph_forward(struct ccml_graph * graph, ccml_tensor * tensor,
@@ -793,95 +735,6 @@ static void ccml_graph_backward(ccml_graph * graph, ccml_tensor * root) {
     }
 }
 
-static void ccml_graph_generate_ir(ccml_graph * graph) {
-    int size = CCML_NODE_MAX * CCML_CHAR_MAX;
-    char * str = graph->ir;
-
-    for (int i = 0; i < graph->n_nodes; i++) {
-        ccml_tensor * tensor = graph->nodes[i];
-
-        switch (tensor->oper) {
-            case CCML_OPER_NONE:
-                // tensor data is embeddeable directly into the kernel string
-                if (tensor->buff == CCML_BUFF_INTR && ccml_size(tensor) == 1) {
-                    str += snprintf(str, size - (str - graph->ir), "\t%s data_%d = %f;\n",
-                                    ccml_type_to_string(tensor->type), i, *(float *)tensor->data);
-                }
-                break;
-            case CCML_OPER_LOG:
-            case CCML_OPER_EXP:
-            case CCML_OPER_SIN:
-            case CCML_OPER_REC:
-            case CCML_OPER_SQRT:
-                if (ccml_has_buffer(tensor)) {
-                    str += snprintf(str, size - (str - graph->ir), "\tdata_%d[idx] = ", i);
-                } else {
-                    str += snprintf(str, size - (str - graph->ir), "\t%s data_%d = ",
-                                    ccml_type_to_string(tensor->type), i);
-                }
-
-                if (ccml_has_buffer(tensor->src[0])) {
-                    str += snprintf(str, size - (str - graph->ir), "%s(data_%d[idx]);\n",
-                                    ccml_oper_to_string(tensor->oper), tensor->src[0]->index);
-                } else {
-                    str += snprintf(str, size - (str - graph->ir), "%s(data_%d);\n",
-                                    ccml_oper_to_string(tensor->oper), tensor->src[0]->index);
-                }
-
-                break;
-            case CCML_OPER_ADD:
-            case CCML_OPER_MUL:
-                if (ccml_has_buffer(tensor)) {
-                    str += snprintf(str, size - (str - graph->ir), "\tdata_%d[idx] = ", i);
-                } else {
-                    str += snprintf(str, size - (str - graph->ir),
-                                    "\t%s data_%d = ", ccml_type_to_string(tensor->type), i);
-                }
-
-                if (ccml_has_buffer(tensor->src[0])) {
-                    str += snprintf(str, size - (str - graph->ir), "data_%d[%s] %s ",
-                                    tensor->src[0]->index, ccml_broadcasting_index(tensor, tensor->src[0]),
-                                    ccml_oper_to_string(tensor->oper));
-                } else {
-                    str += snprintf(str, size - (str - graph->ir), "data_%d %s ",
-                                    tensor->src[0]->index, ccml_oper_to_string(tensor->oper));
-                }
-
-                if (ccml_has_buffer(tensor->src[1])) {
-                    str += snprintf(str, size - (str - graph->ir),
-                                    "data_%d[%s];\n", tensor->src[1]->index,
-                                    ccml_broadcasting_index(tensor, tensor->src[1]));
-                } else {
-                    str += snprintf(str, size - (str - graph->ir), "data_%d;\n",
-                                    tensor->src[1]->index);
-                }
-
-                break;
-            case CCML_OPER_RESHAPE:
-            case CCML_OPER_PERMUTE:
-                str += snprintf(str, size - (str - graph->ir),
-                                "\t%s * data_%d = data_%d;\n",
-                                ccml_type_to_string(tensor->type), i, tensor->src[0]->index);
-                break;
-            case CCML_OPER_SUM_REDUCE:
-                str += snprintf(str, size - (str - graph->ir),
-                                "\tdata_%d[%s] += ", tensor->index,
-                                ccml_reduction_index(tensor, tensor->src[0]));
-
-                if (ccml_has_buffer(tensor->src[0])) {
-                    str += snprintf(str, size - (str - graph->ir),
-                                    "data_%d[idx];\n", tensor->src[0]->index);
-                } else {
-                    str += snprintf(str, size - (str - graph->ir),
-                                    "data_%d;\n", tensor->src[0]->index);
-                }
-
-                break;
-            default: assert(false && "unknown variant of ccml_oper");
-        }
-    }
-}
-
 static void ccml_graph_node_buffers(struct ccml_graph * graph) {
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
@@ -914,15 +767,13 @@ static ccml_graph * ccml_new_graph(ccml_tensor * root) {
     *graph = (struct ccml_graph){
         /*.n_nodes =*/ 0,
         /*.nodes   =*/ {NULL},
-        /*.map     =*/ ccml_new_hashmap(),
-        /*.ir      =*/ {'\0'}
+        /*.map     =*/ ccml_new_hashmap()
     };
 
     ccml_graph_forward(graph, root, &graph->n_nodes);
     ccml_graph_backward(graph, root);
 
     ccml_graph_node_buffers(graph);
-    ccml_graph_generate_ir(graph);
 
     return graph;
 };
@@ -965,18 +816,51 @@ static void ccml_graph_free(ccml_graph * graph) {
 
 // clang-format on
 
+static const char * ccml_oper_to_string_cuda(ccml_oper oper) {
+    switch (oper) {
+        case CCML_OPER_LOG:
+            return "log";
+        case CCML_OPER_EXP:
+            return "exp";
+        case CCML_OPER_SIN:
+            return "sin";
+        case CCML_OPER_REC:
+            return "1/";
+        case CCML_OPER_SQRT:
+            return "sqrt";
+        case CCML_OPER_ADD:
+            return "+";
+        case CCML_OPER_MUL:
+            return "*";
+        default:
+            assert(false && "no meaningful conversion to string exists");
+    }
+}
+
+static const char * ccml_type_to_string_cuda(ccml_type type) {
+    switch (type) {
+        case CCML_TYPE_FP16:
+            return "__half";
+        case CCML_TYPE_FP32:
+            return "float";
+        case CCML_TYPE_FP64:
+            return "double";
+        default:
+            assert(false && "unknown variant of ccml_type");
+    }
+}
+
 static const char * ccml_parser_cuda(struct ccml_graph * graph) {
     int size = CCML_NODE_MAX * CCML_CHAR_MAX;
-    char * kernel_string = malloc(size * sizeof(char));
-    char * str = kernel_string;
-    *kernel_string = '\0';
+    char * kernel = malloc(size * sizeof(char));
+    char * string = kernel;
+    *string = '\0';
 
     // adding includes and kernel function signature to the
     // kernel string
 
-    int offset = snprintf(kernel_string + strlen(kernel_string), size - strlen(graph->ir),
-                          "#include <cuda_fp16.h>\n\n__global__ void ccml_kernel(");
-    str += offset;
+    string += snprintf(string, size - (kernel - string), "#include <cuda_fp16.h>\n"
+                       "\n__global__ void ccml_kernel(");
 
     // adding kernel input parameters to the kernel string
 
@@ -991,35 +875,106 @@ static const char * ccml_parser_cuda(struct ccml_graph * graph) {
 
         if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
             if (n_kernel_parameters == 0) {
-                    str += snprintf(str, size - (str - kernel_string),
-                                    "%s * data_%d", ccml_type_to_string(tensor->type), i);
+                string += snprintf(string, size - (kernel - string), "%s * data_%d",
+                                   ccml_type_to_string_cuda(tensor->type), i);
                 n_kernel_parameters++;
             } else {
-                    str += snprintf(str, size - (str - kernel_string),
-                                    ", %s * data_%d", ccml_type_to_string(tensor->type), i);
+                string += snprintf(string, size - (kernel - string), ", %s * data_%d",
+                                   ccml_type_to_string_cuda(tensor->type), i);
                 n_kernel_parameters++;
             }
         }
     }
 
-      str += snprintf(str, size - (str - kernel_string),
-                      ") {\n\tint idx = blockDim.x * blockIdx.x + threadIdx.x;\n"
-                      "\tif (idx < %d) return;\n\n",
-                      largest_tensor);
+    string += snprintf(string, size - (kernel - string),
+                       ") {\n\tint idx = blockDim.x * blockIdx.x + threadIdx.x;\n"
+                       "\tif (idx < %d) return;\n\n", largest_tensor);
 
-    // prepending kernel_string to graph->ir
-    memmove(kernel_string + strlen(kernel_string), graph->ir, strlen(graph->ir) + 1);
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ccml_tensor * tensor = graph->nodes[i];
 
-    // cuda specific type substitution (i.e. fp16 to __half and fp32 to float)
-    // adding offset so that fp16 from the include header name doesn't get
-    // replaced
-    ccml_find_and_replace(kernel_string + offset, "fp16", "__half");
-    ccml_find_and_replace(kernel_string + offset, "fp32", "float");
-    ccml_find_and_replace(kernel_string + offset, "fp64", "double");
+        switch (tensor->oper) {
+            case CCML_OPER_NONE:
+                // tensor data is embeddeable directly into the kernel string
+                if (tensor->buff == CCML_BUFF_INTR && ccml_size(tensor) == 1) {
+                    string += snprintf(string, size - (kernel - string), "\t%s data_%d = %f;\n",
+                                       ccml_type_to_string_cuda(tensor->type), i, *(float *)tensor->data);
+                }
+                break;
+            case CCML_OPER_LOG:
+            case CCML_OPER_EXP:
+            case CCML_OPER_SIN:
+            case CCML_OPER_REC:
+            case CCML_OPER_SQRT:
+                if (ccml_has_buffer(tensor)) {
+                    string += snprintf(string, size - (kernel - string), "\tdata_%d[idx] = ", i);
+                } else {
+                    string += snprintf(string, size - (kernel - string), "\t%s data_%d = ",
+                                       ccml_type_to_string_cuda(tensor->type), i);
+                }
+
+                if (ccml_has_buffer(tensor->src[0])) {
+                    string += snprintf(string, size - (kernel - string), "%s(data_%d[idx]);\n",
+                                       ccml_oper_to_string_cuda(tensor->oper), tensor->src[0]->index);
+                } else {
+                    string += snprintf(string, size - (kernel - string), "%s(data_%d);\n",
+                                       ccml_oper_to_string_cuda(tensor->oper), tensor->src[0]->index);
+                }
+
+                break;
+            case CCML_OPER_ADD:
+            case CCML_OPER_MUL:
+                if (ccml_has_buffer(tensor)) {
+                    string += snprintf(string, size - (kernel - string), "\tdata_%d[idx] = ", i);
+                } else {
+                    string += snprintf(string, size - (kernel - string), "\t%s data_%d = ",
+                                       ccml_type_to_string_cuda(tensor->type), i);
+                }
+
+                if (ccml_has_buffer(tensor->src[0])) {
+                    string += snprintf(string, size - (kernel - string), "data_%d[%s] %s ",
+                                       tensor->src[0]->index, ccml_broadcasting_index(tensor, tensor->src[0]),
+                                       ccml_oper_to_string_cuda(tensor->oper));
+                } else {
+                    string += snprintf(string, size - (kernel - string), "data_%d %s ",
+                                       tensor->src[0]->index, ccml_oper_to_string_cuda(tensor->oper));
+                }
+
+                if (ccml_has_buffer(tensor->src[1])) {
+                    string += snprintf(string, size - (kernel - string),
+                                       "data_%d[%s];\n", tensor->src[1]->index,
+                                        ccml_broadcasting_index(tensor, tensor->src[1]));
+                } else {
+                    string += snprintf(string, size - (kernel - string), "data_%d;\n",
+                                       tensor->src[1]->index);
+                }
+
+                break;
+            case CCML_OPER_RESHAPE:
+            case CCML_OPER_PERMUTE:
+                string += snprintf(string, size - (kernel - string), "\t%s * data_%d = data_%d;\n",
+                                   ccml_type_to_string_cuda(tensor->type), i, tensor->src[0]->index);
+                break;
+            case CCML_OPER_SUM_REDUCE:
+                string += snprintf(string, size - (kernel - string), "\tdata_%d[%s] += ", tensor->index,
+                                   ccml_reduction_index(tensor, tensor->src[0]));
+
+                if (ccml_has_buffer(tensor->src[0])) {
+                    string += snprintf(string, size - (kernel - string),
+                                    "data_%d[idx];\n", tensor->src[0]->index);
+                } else {
+                    string += snprintf(string, size - (kernel - string),
+                                    "data_%d;\n", tensor->src[0]->index);
+                }
+
+                break;
+            default: assert(false && "unknown variant of ccml_oper");
+        }
+    }
 
     // adding the closing braces/brackets :)
-    snprintf(kernel_string + strlen(kernel_string), size - strlen(graph->ir), "}");
-    return kernel_string;
+    string += snprintf(string, size - (kernel - string), "}");
+    return kernel;
 }
 
 #endif
