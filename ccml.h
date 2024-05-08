@@ -66,9 +66,9 @@ typedef enum ccml_oper {
     CCML_OPER_SQRT,
     CCML_OPER_ADD,
     CCML_OPER_MUL,
+    CCML_OPER_SUM,
     CCML_OPER_RESHAPE,
-    CCML_OPER_PERMUTE,
-    CCML_OPER_SUM_REDUCE
+    CCML_OPER_PERMUTE
 } ccml_oper;
 
 typedef struct ccml_tensor ccml_tensor;
@@ -89,8 +89,6 @@ typedef struct ccml_tensor {
     int index;
     void * data;
 } ccml_tensor;
-
-// clang-format off
 
 //
 //  ██╗███╗   ██╗██╗████████╗
@@ -127,8 +125,6 @@ static ccml_tensor * ccml_new_tensor_impl(ccml_type type, int shape[CCML_DIMS_MA
 
     return result;
 }
-
-// clang-format on
 
 static ccml_tensor * ccml_new_tensor_1d(ccml_type type, int ne0, bool has_grad) {
     int shape[CCML_DIMS_MAX] = {ne0, 1, 1, 1};
@@ -197,8 +193,6 @@ static void ccml_tensor_ones(ccml_tensor * tensor) {
     }
 }
 
-// clang-format off
-
 //
 //  ███╗   ███╗██╗███████╗ ██████╗
 //  ████╗ ████║██║██╔════╝██╔════╝
@@ -214,8 +208,6 @@ static void ccml_tensor_ones(ccml_tensor * tensor) {
 //  ██║     ╚██████╔╝██║ ╚████║╚██████╗   ██║   ██║╚██████╔╝██║ ╚████║███████║
 //  ╚═╝      ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
 //
-
-// clang-format on
 
 static bool ccml_can_broadcast(ccml_tensor * lhs, ccml_tensor * rhs) {
     if (rhs == NULL || lhs == NULL)
@@ -235,18 +227,10 @@ static bool ccml_broadcasted(ccml_tensor * lhs, ccml_tensor * rhs) {
 }
 
 static bool ccml_has_buffer(ccml_tensor * tensor) {
-    switch (tensor->buff) {
-        case CCML_BUFF_NONE:
-        case CCML_BUFF_INTR:
-            return false;
-        default:
-            return true;
-    }
+    return tensor->buff != CCML_BUFF_NONE;
 }
 
-// clang-format off
-
-static int ccml_tensor_n_dim(ccml_tensor * tensor) {
+static int ccml_n_dim(ccml_tensor * tensor) {
     int last_dim = 0;
     for (int i = 0; i < CCML_DIMS_MAX; i++) {
         if(tensor->shape[i] != 1) last_dim = i;
@@ -279,8 +263,6 @@ static bool ccml_is_matrix(ccml_tensor * tensor) {
 //  ╚██████╔╝██║     ███████╗██║  ██║██║  ██║   ██║   ██║╚██████╔╝██║ ╚████║███████║
 //   ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
 //
-
-// clang-format on
 
 #define CCML_UNARY_OPERATION(function, operation)                                              \
 static ccml_tensor * function(ccml_tensor * tensor) {                                          \
@@ -364,7 +346,7 @@ static ccml_tensor * ccml_reshape(ccml_tensor * tensor, int shape[CCML_DIMS_MAX]
 
 static ccml_tensor * ccml_permute(ccml_tensor * tensor, int perm[CCML_DIMS_MAX]) {
     ccml_tensor * result = ccml_new_tensor_impl(tensor->type, tensor->shape);
-    int n_dim = ccml_tensor_n_dim(tensor);
+    int n_dim = ccml_n_dim(tensor);
     for (int i = 0; i < n_dim; i++) {
         result->shape[i] = tensor->shape[perm[i]];
         result->stride[i] = tensor->stride[perm[i]];
@@ -392,15 +374,13 @@ static ccml_tensor * ccml_sum(ccml_tensor * tensor, int n_axes, int axes[CCML_DI
 
     ccml_tensor * result = ccml_new_tensor_impl(tensor->type, shape);
 
-    result->oper = CCML_OPER_SUM_REDUCE;
+    result->oper = CCML_OPER_SUM;
     result->buff = CCML_BUFF_INTR;
     result->src[0] = tensor;
     result->has_grad = tensor->has_grad;
 
     return result;
 }
-
-// clang-format off
 
 //
 //  ███╗   ██╗ ██████╗ ███╗   ██╗       ██████╗ ██████╗ ██████╗ ███████╗
@@ -417,8 +397,6 @@ static ccml_tensor * ccml_sum(ccml_tensor * tensor, int n_axes, int axes[CCML_DI
 //  ╚██████╔╝██║     ███████╗██║  ██║██║  ██║   ██║   ██║╚██████╔╝██║ ╚████║███████║
 //   ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
 //
-
-// clang-format on
 
 static ccml_tensor * ccml_neg(ccml_tensor * tensor) {
     return ccml_log(ccml_rec(ccml_exp(tensor)));
@@ -463,8 +441,6 @@ static ccml_tensor * ccml_matmul(ccml_tensor * lhs, ccml_tensor * rhs) {
     return sum;
 }
 
-// clang-format off
-
 //
 //  ██╗  ██╗ █████╗ ███████╗██╗  ██╗███╗   ███╗ █████╗ ██████╗
 //  ██║  ██║██╔══██╗██╔════╝██║  ██║████╗ ████║██╔══██╗██╔══██╗
@@ -473,8 +449,6 @@ static ccml_tensor * ccml_matmul(ccml_tensor * lhs, ccml_tensor * rhs) {
 //  ██║  ██║██║  ██║███████║██║  ██║██║ ╚═╝ ██║██║  ██║██║
 //  ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═╝
 //
-
-// clang-format on
 
 #define CCML_FNV_PRIME 1099511628211LU
 #define CCML_FNV_OFFSET 14695981039346656037LU
@@ -565,60 +539,6 @@ static void ccml_hashmap_set(ccml_hashmap * map, void * key, int value) {
 }
 
 //
-//  ██╗   ██████╗
-//  ██║   ██╔══██╗
-//  ██║   ██████╔╝
-//  ██║   ██╔══██╗
-//  ██║██╗██║  ██║██╗
-//  ╚═╝╚═╝╚═╝  ╚═╝╚═╝
-//
-
-// both reduction and broadcasting index functions look terrible, there has to be a cleaner
-// and concise way to express this
-
-static const char * ccml_reduction_index(ccml_tensor * parent, ccml_tensor * child) {
-    if (parent->shape[0] == child->shape[0] && parent->shape[1] == child->shape[1] &&
-        parent->shape[2] == child->shape[2] && parent->shape[3] == child->shape[3]) {
-        return "idx";
-    }
-
-    char * result = malloc(CCML_CHAR_MAX * CCML_DIMS_MAX * sizeof(char));
-    int size = CCML_CHAR_MAX * CCML_DIMS_MAX;
-    *result = '\0';
-
-    for (int i = 0; i < ccml_tensor_n_dim(parent); i++) {
-       snprintf(result + strlen(result), size - strlen(result), "%s(idx/%d)%%%d*%d",
-                 i != 0 && i != ccml_tensor_n_dim(parent) ? "+" : "", child->stride[i],
-                 parent->shape[i], parent->stride[i]);
-    }
-
-    return result;
-}
-
-static const char * ccml_broadcasting_index(ccml_tensor * parent, ccml_tensor * child) {
-    if (parent->shape[0] == child->shape[0] && parent->shape[1] == child->shape[1] &&
-        parent->shape[2] == child->shape[2] && parent->shape[3] == child->shape[3]) {
-        return "idx";
-    }
-
-    char * result = malloc(CCML_CHAR_MAX * CCML_DIMS_MAX * sizeof(char));
-    int size = CCML_CHAR_MAX * CCML_DIMS_MAX;
-    *result = '\0';
-
-    for (int i = 0; i < ccml_tensor_n_dim(parent); i++) {
-        // disgusting 🤢
-        snprintf(result + strlen(result), size - strlen(result), "%s(idx/%d)%%%d*%d",
-                           i != 0 && i != ccml_tensor_n_dim(parent) ? "+" : "", parent->stride[i],
-                           child->shape[i] == 1 && i < ccml_tensor_n_dim(child) ? 1 : child->shape[i],
-                           child->stride[i]);
-    }
-
-    return result;
-}
-
-// clang-format off
-
-//
 //   ██████╗ ██████╗  █████╗ ██████╗ ██╗  ██╗
 //  ██╔════╝ ██╔══██╗██╔══██╗██╔══██╗██║  ██║
 //  ██║  ███╗██████╔╝███████║██████╔╝███████║
@@ -626,8 +546,6 @@ static const char * ccml_broadcasting_index(ccml_tensor * parent, ccml_tensor * 
 //  ╚██████╔╝██║  ██║██║  ██║██║     ██║  ██║
 //   ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝
 //
-
-// clang-format on
 
 typedef struct ccml_graph {
     int n_nodes;
@@ -709,7 +627,7 @@ static void ccml_graph_backward(ccml_graph * graph, ccml_tensor * root) {
                     partial_0 = one; break;
                 case CCML_OPER_PERMUTE:
                     partial_0 = one; break;
-                case CCML_OPER_SUM_REDUCE:
+                case CCML_OPER_SUM:
                     partial_0 = one; break;
                 default:
                     assert(false && "unknown variant of ccml_oper");
@@ -796,7 +714,35 @@ static void ccml_graph_free(ccml_graph * graph) {
     free(graph);
 }
 
-// clang-format off
+//
+//  ██╗███╗   ██╗██████╗ ██╗ ██████╗███████╗███████╗
+//  ██║████╗  ██║██╔══██╗██║██╔════╝██╔════╝██╔════╝
+//  ██║██╔██╗ ██║██║  ██║██║██║     █████╗  ███████╗
+//  ██║██║╚██╗██║██║  ██║██║██║     ██╔══╝  ╚════██║
+//  ██║██║ ╚████║██████╔╝██║╚██████╗███████╗███████║
+//  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝ ╚═════╝╚══════╝╚══════╝
+//
+
+// both reduction and broadcasting index functions look terrible, there has to be a cleaner
+// and concise way to express this
+
+#define ccml_index(tensor, condition) ({                                         \
+    int size = CCML_CHAR_MAX * CCML_DIMS_MAX;                                    \
+    char * result = malloc(size * sizeof(char));                                 \
+    *result = '\0';                                                              \
+    strncat(result, "[", size);                                                  \
+                                                                                 \
+    for (int i = 0; i < ccml_n_dim(tensor); i++) {                               \
+        snprintf(result + strlen(result), size - strlen(result), "%sid%d*%d*%d", \
+                 i != 0 && i != ccml_n_dim(tensor) ? "+" : "", i,                \
+                 tensor->stride[i], (condition) ? 1 : 0);                        \
+    }                                                                            \
+                                                                                 \
+    strncat(result + strlen(result), "]", size - strlen(result));                \
+    if (ccml_has_buffer(tensor) == false) snprintf(result, size, "");            \
+                                                                                 \
+    result;                                                                      \
+})
 
 //
 //  ██████╗  █████╗  ██████╗██╗  ██╗███████╗███╗   ██╗██████╗
@@ -813,8 +759,6 @@ static void ccml_graph_free(ccml_graph * graph) {
 //  ╚██████╗╚██████╔╝██████╔╝██║  ██║
 //   ╚═════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝
 //
-
-// clang-format on
 
 static const char * ccml_oper_to_string_cuda(ccml_oper oper) {
     switch (oper) {
@@ -840,11 +784,11 @@ static const char * ccml_oper_to_string_cuda(ccml_oper oper) {
 static const char * ccml_type_to_string_cuda(ccml_type type) {
     switch (type) {
         case CCML_TYPE_FP16:
-            return "__half";
+            return "__half ";
         case CCML_TYPE_FP32:
-            return "float";
+            return "float ";
         case CCML_TYPE_FP64:
-            return "double";
+            return "double ";
         default:
             assert(false && "unknown variant of ccml_type");
     }
@@ -865,30 +809,35 @@ static const char * ccml_parser_cuda(struct ccml_graph * graph) {
     // adding kernel input parameters to the kernel string
 
     int n_kernel_parameters = 0;
-    int largest_tensor = 1;
+    int largest_tensor = 0;
 
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
-        int tensor_size = ccml_size(tensor);
-        if (tensor_size > largest_tensor)
-            largest_tensor = tensor_size;
+        if (ccml_size(tensor) > ccml_size(graph->nodes[largest_tensor]))
+            largest_tensor = i;
 
-        if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
+        if (tensor->buff != CCML_BUFF_NONE && ccml_size(tensor) != 1) {
             if (n_kernel_parameters == 0) {
-                string += snprintf(string, size - (kernel - string), "%s * data_%d",
+                string += snprintf(string, size - (kernel - string), "%s* data_%d",
                                    ccml_type_to_string_cuda(tensor->type), i);
                 n_kernel_parameters++;
             } else {
-                string += snprintf(string, size - (kernel - string), ", %s * data_%d",
+                string += snprintf(string, size - (kernel - string), ", %s* data_%d",
                                    ccml_type_to_string_cuda(tensor->type), i);
                 n_kernel_parameters++;
             }
         }
     }
 
-    string += snprintf(string, size - (kernel - string),
-                       ") {\n\tint idx = blockDim.x * blockIdx.x + threadIdx.x;\n"
-                       "\tif (idx < %d) return;\n\n", largest_tensor);
+    string += snprintf(string, size - (kernel - string), ") {\n"
+                       "\tint id0 = blockIdx.x * blockDim.x + threadIdx.x; /* %d */\n"
+                       "\tint id1 = blockIdx.y * blockDim.y + threadIdx.y; /* %d */\n"
+                       "\tint id2 = blockIdx.z * blockDim.z + threadIdx.z; /* %d */\n"
+                       "\tfor (int id3 = 0; id3 < %d; id3++) {\n",
+                       graph->nodes[largest_tensor]->shape[0],
+                       graph->nodes[largest_tensor]->shape[1],
+                       graph->nodes[largest_tensor]->shape[2],
+                       graph->nodes[largest_tensor]->shape[3]);
 
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
@@ -896,8 +845,8 @@ static const char * ccml_parser_cuda(struct ccml_graph * graph) {
         switch (tensor->oper) {
             case CCML_OPER_NONE:
                 // tensor data is embeddeable directly into the kernel string
-                if (tensor->buff == CCML_BUFF_INTR && ccml_size(tensor) == 1) {
-                    string += snprintf(string, size - (kernel - string), "\t%s data_%d = %f;\n",
+                if (ccml_size(tensor) == 1) {
+                    string += snprintf(string, size - (kernel - string), "\t\t%sdata_%d = %f;\n",
                                        ccml_type_to_string_cuda(tensor->type), i, *(float *)tensor->data);
                 }
                 break;
@@ -906,74 +855,43 @@ static const char * ccml_parser_cuda(struct ccml_graph * graph) {
             case CCML_OPER_SIN:
             case CCML_OPER_REC:
             case CCML_OPER_SQRT:
-                if (ccml_has_buffer(tensor)) {
-                    string += snprintf(string, size - (kernel - string), "\tdata_%d[idx] = ", i);
-                } else {
-                    string += snprintf(string, size - (kernel - string), "\t%s data_%d = ",
-                                       ccml_type_to_string_cuda(tensor->type), i);
-                }
-
-                if (ccml_has_buffer(tensor->src[0])) {
-                    string += snprintf(string, size - (kernel - string), "%s(data_%d[idx]);\n",
-                                       ccml_oper_to_string_cuda(tensor->oper), tensor->src[0]->index);
-                } else {
-                    string += snprintf(string, size - (kernel - string), "%s(data_%d);\n",
-                                       ccml_oper_to_string_cuda(tensor->oper), tensor->src[0]->index);
-                }
-
+                string += snprintf(string, size - (kernel - string), "\t\t%sdata_%d%s = ",
+                                   ccml_has_buffer(tensor) ? "" : ccml_type_to_string_cuda(tensor->type),
+                                   tensor->index, ccml_index(tensor, true));
+                string += snprintf(string, size - (kernel - string), "%s(data_%d%s);\n",
+                                   ccml_oper_to_string_cuda(tensor->oper),
+                                   tensor->src[0]->index, ccml_index(tensor->src[0], true));
                 break;
             case CCML_OPER_ADD:
             case CCML_OPER_MUL:
-                if (ccml_has_buffer(tensor)) {
-                    string += snprintf(string, size - (kernel - string), "\tdata_%d[idx] = ", i);
-                } else {
-                    string += snprintf(string, size - (kernel - string), "\t%s data_%d = ",
-                                       ccml_type_to_string_cuda(tensor->type), i);
-                }
-
-                if (ccml_has_buffer(tensor->src[0])) {
-                    string += snprintf(string, size - (kernel - string), "data_%d[%s] %s ",
-                                       tensor->src[0]->index, ccml_broadcasting_index(tensor, tensor->src[0]),
-                                       ccml_oper_to_string_cuda(tensor->oper));
-                } else {
-                    string += snprintf(string, size - (kernel - string), "data_%d %s ",
-                                       tensor->src[0]->index, ccml_oper_to_string_cuda(tensor->oper));
-                }
-
-                if (ccml_has_buffer(tensor->src[1])) {
-                    string += snprintf(string, size - (kernel - string),
-                                       "data_%d[%s];\n", tensor->src[1]->index,
-                                        ccml_broadcasting_index(tensor, tensor->src[1]));
-                } else {
-                    string += snprintf(string, size - (kernel - string), "data_%d;\n",
-                                       tensor->src[1]->index);
-                }
-
+                string += snprintf(string, size - (kernel - string), "\t\t%sdata_%d%s = ",
+                                   ccml_has_buffer(tensor) ? "" : ccml_type_to_string_cuda(tensor->type),
+                                   tensor->index, ccml_index(tensor, true));
+                string += snprintf(string, size - (kernel - string), "data_%d%s %s ",
+                                   tensor->src[0]->index, ccml_index(tensor->src[0], tensor->src[0]->shape[i] != 1),
+                                   ccml_oper_to_string_cuda(tensor->oper));
+                string += snprintf(string, size - (kernel - string), "data_%d%s;\n",
+                                   tensor->src[1]->index, ccml_index(tensor->src[1], tensor->src[1]->shape[i] != 1));
                 break;
             case CCML_OPER_RESHAPE:
             case CCML_OPER_PERMUTE:
-                string += snprintf(string, size - (kernel - string), "\t%s * data_%d = data_%d;\n",
-                                   ccml_type_to_string_cuda(tensor->type), i, tensor->src[0]->index);
+                string += snprintf(string, size - (kernel - string), "\t\t%s* data_%d = ",
+                                   ccml_type_to_string_cuda(tensor->type), tensor->index);
+                string += snprintf(string, size - (kernel - string), "data_%d;\n",
+                                   tensor->src[0]->index);
                 break;
-            case CCML_OPER_SUM_REDUCE:
-                string += snprintf(string, size - (kernel - string), "\tdata_%d[%s] += ", tensor->index,
-                                   ccml_reduction_index(tensor, tensor->src[0]));
-
-                if (ccml_has_buffer(tensor->src[0])) {
-                    string += snprintf(string, size - (kernel - string),
-                                    "data_%d[idx];\n", tensor->src[0]->index);
-                } else {
-                    string += snprintf(string, size - (kernel - string),
-                                    "data_%d;\n", tensor->src[0]->index);
-                }
-
+            case CCML_OPER_SUM:
+                string += snprintf(string, size - (kernel - string), "\t\tdata_%d%s += ",
+                                   tensor->index, ccml_index(tensor, tensor->shape[i] != 1));
+                string += snprintf(string, size - (kernel - string), "data_%d%s;\n",
+                                   tensor->src[0]->index, ccml_index(tensor->src[0], tensor->shape[i] != tensor->src[0]->shape[i]));
                 break;
             default: assert(false && "unknown variant of ccml_oper");
         }
     }
 
     // adding the closing braces/brackets :)
-    string += snprintf(string, size - (kernel - string), "}");
+    string += snprintf(string, size - (kernel - string), "\t}\n}");
     return kernel;
 }
 
