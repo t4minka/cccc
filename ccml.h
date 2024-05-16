@@ -6,7 +6,7 @@
 #define CCML_DIMS_MAX 4
 
 #define CCML_CHAR_MAX 100
-#define CCML_NODE_MAX 256
+#define CCML_NODE_MAX 128
 
 #define __STDC_WANT_IEC_60559_TYPES_EXT__
 #include <float.h>
@@ -14,14 +14,19 @@
 #include <assert.h>
 #include <math.h>
 #include <stdbool.h>
-#include <assert.h>
+#include <stdatomic.h>
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// clang-format off
+// known issues:
+// - including ccml.h in separate compilation units compiles separate/independent symbols
+// - tensors of size 1 aren't supported, due to attempting to embed them into the kernel
+// - metal lacks support for floating point atomics, so rn handling w/ int atomics
+// - a lot of function return statuses aren't checked, mostly snprintf/fread/fwrite
+// - if a tensor isn't part of a graph it won't get freed by ccml_graph_free()
 
 //
 //  ████████╗███████╗███╗   ██╗███████╗ ██████╗ ██████╗
@@ -32,29 +37,25 @@
 //     ╚═╝   ╚══════╝╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝
 //
 
-// clang-format on
+typedef enum ccml_backend {
+    CCML_BACKEND_METAL
+} ccml_backend;
 
 typedef enum ccml_type {
-    CCML_TYPE_FP16,
-    CCML_TYPE_FP32,
-    CCML_TYPE_FP64
+    CCML_TYPE_FP32
 } ccml_type;
 
 const static int ccml_type_sizes[CCML_TYPE_MAX] = {
-#if defined(FLT16_MAX)
-    [CCML_TYPE_FP16] = sizeof(_Float16),
-#else
-    [CCML_TYPE_FP16] = sizeof(float),
-#endif
     [CCML_TYPE_FP32] = sizeof(float),
-    [CCML_TYPE_FP64] = sizeof(double)
 };
 
 typedef enum ccml_buff {
+    // no buffer, values only existing as intermediary scalars in the kernel
     CCML_BUFF_NONE,
-    CCML_BUFF_INTR,
-    CCML_BUFF_LOAD,
-    CCML_BUFF_SAVE
+    // dedicated buffer for constant values
+    CCML_BUFF_CNST,
+    // dedicated buffer for loaded/saved values
+    CCML_BUFF_PERM
 } ccml_buff;
 
 typedef enum ccml_oper {
@@ -62,22 +63,21 @@ typedef enum ccml_oper {
     CCML_OPER_LOG,
     CCML_OPER_EXP,
     CCML_OPER_SIN,
-    CCML_OPER_REC,
+    CCML_OPER_REC, // reciprocal
     CCML_OPER_SQRT,
     CCML_OPER_ADD,
     CCML_OPER_MUL,
     CCML_OPER_SUM,
-    CCML_OPER_RESHAPE,
-    CCML_OPER_PERMUTE
+    CCML_OPER_RES, // reshape
+    CCML_OPER_PER, // permute
 } ccml_oper;
 
 typedef struct ccml_tensor ccml_tensor;
 
 typedef struct ccml_tensor {
     ccml_type type;
-    ccml_oper oper;
-
     ccml_buff buff;
+    int oper;
 
     int shape[CCML_DIMS_MAX];
     int stride[CCML_DIMS_MAX];
@@ -85,9 +85,9 @@ typedef struct ccml_tensor {
     ccml_tensor * src[CCML_SRCS_MAX];
     ccml_tensor * grad;
 
-    bool has_grad;
     int index;
     void * data;
+    bool requires_grad;
 } ccml_tensor;
 
 //
@@ -106,63 +106,65 @@ typedef struct ccml_tensor {
 //  ╚═╝      ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
 //
 
-static ccml_tensor * ccml_new_tensor_impl(ccml_type type, int shape[CCML_DIMS_MAX]) {
+static ccml_tensor * ccml_new_tensor_impl(ccml_type type, int * shape) {
     ccml_tensor * result = malloc(sizeof(ccml_tensor));
 
     *result = (ccml_tensor){
-       /*.type       =*/ type,
-       /*.oper       =*/ CCML_OPER_NONE,
-       /*.buff       =*/ CCML_BUFF_NONE,
-       /*.shape      =*/ {shape[0], shape[1], shape[2], shape[3]},
-       /*.stride     =*/ {shape[1] * shape[2] * shape[3],
-                          shape[2] * shape[3], shape[3], 1},
-       /*.src        =*/ {NULL},
-       /*.grad       =*/ NULL,
-       /*.has_grad   =*/ false,
-       /*.index      =*/ -1,
-       /*.data       =*/ NULL,
+    /*.type          =*/ type,
+    /*.buff          =*/ CCML_BUFF_NONE,
+    /*.oper          =*/ CCML_OPER_NONE,
+    /*.shape         =*/ {shape[0], shape[1], shape[2], shape[3]},
+    /*.stride        =*/ {shape[1] * shape[2] * shape[3], shape[2] * shape[3], shape[3], 1},
+    /*.src           =*/ {NULL},
+    /*.grad          =*/ NULL,
+    /*.index         =*/ -1,
+    /*.data          =*/ NULL,
+    /*.requires_grad =*/ false,
     };
 
     return result;
 }
 
-static ccml_tensor * ccml_new_tensor_1d(ccml_type type, int ne0, bool has_grad) {
+static ccml_tensor * ccml_new_tensor_1d(ccml_type type, int ne0,
+                                        bool requires_grad) {
     int shape[CCML_DIMS_MAX] = {ne0, 1, 1, 1};
 
     ccml_tensor * result = ccml_new_tensor_impl(type, shape);
-    result->buff = CCML_BUFF_LOAD;
-    result->has_grad = has_grad;
+    result->buff = CCML_BUFF_PERM;
+    result->requires_grad = requires_grad;
 
     return result;
 }
 
-static ccml_tensor * ccml_new_tensor_2d(ccml_type type, int ne0, int ne1, bool has_grad) {
+static ccml_tensor * ccml_new_tensor_2d(ccml_type type, int ne0, int ne1,
+                                        bool requires_grad) {
     int shape[CCML_DIMS_MAX] = {ne0, ne1, 1, 1};
 
     ccml_tensor * result = ccml_new_tensor_impl(type, shape);
-    result->buff = CCML_BUFF_LOAD;
-    result->has_grad = has_grad;
+    result->buff = CCML_BUFF_PERM;
+    result->requires_grad = requires_grad;
 
     return result;
 }
 
-static ccml_tensor * ccml_new_tensor_3d(ccml_type type, int ne0, int ne1, int ne2, bool has_grad) {
+static ccml_tensor * ccml_new_tensor_3d(ccml_type type, int ne0, int ne1, int ne2,
+                                        bool requires_grad) {
     int shape[CCML_DIMS_MAX] = {ne0, ne1, ne2, 1};
 
     ccml_tensor * result = ccml_new_tensor_impl(type, shape);
-    result->buff = CCML_BUFF_LOAD;
-    result->has_grad = has_grad;
+    result->buff = CCML_BUFF_PERM;
+    result->requires_grad = requires_grad;
 
     return result;
 }
 
 static ccml_tensor * ccml_new_tensor_4d(ccml_type type, int ne0, int ne1, int ne2, int ne3,
-                                 bool has_grad) {
+                                        bool requires_grad) {
     int shape[CCML_DIMS_MAX] = {ne0, ne1, ne2, ne3};
 
     ccml_tensor * result = ccml_new_tensor_impl(type, shape);
-    result->buff = CCML_BUFF_LOAD;
-    result->has_grad = has_grad;
+    result->buff = CCML_BUFF_PERM;
+    result->requires_grad = requires_grad;
 
     return result;
 }
@@ -171,9 +173,9 @@ static int ccml_size(ccml_tensor * tensor) {
     return tensor->shape[0] * tensor->shape[1] * tensor->shape[2] * tensor->shape[3];
 }
 
-static void ccml_tensor_set(ccml_tensor * tensor, float * data) {
+static void ccml_set(ccml_tensor * tensor, float * data) {
     tensor->type = CCML_TYPE_FP32;
-    tensor->buff = CCML_BUFF_INTR;
+    tensor->buff = CCML_BUFF_CNST;
 
     int size = ccml_size(tensor);
     tensor->data = malloc(size * sizeof(float));
@@ -182,14 +184,14 @@ static void ccml_tensor_set(ccml_tensor * tensor, float * data) {
     }
 }
 
-static void ccml_tensor_ones(ccml_tensor * tensor) {
+static void ccml_fill(ccml_tensor * tensor, float value) {
     tensor->type = CCML_TYPE_FP32;
-    tensor->buff = CCML_BUFF_INTR;
+    tensor->buff = CCML_BUFF_CNST;
 
     int size = ccml_size(tensor);
     tensor->data = malloc(size * sizeof(float));
     for (int i = 0; i < size; i++) {
-        *((float*)tensor->data + i) = 1.0f;
+        *((float*)tensor->data + i) = value;
     }
 }
 
@@ -221,16 +223,30 @@ static bool ccml_can_broadcast(ccml_tensor * lhs, ccml_tensor * rhs) {
     return true;
 }
 
-static bool ccml_broadcasted(ccml_tensor * lhs, ccml_tensor * rhs) {
-    return lhs->shape[0] != rhs->shape[0] || lhs->shape[1] != rhs->shape[1] ||
-           lhs->shape[2] != rhs->shape[2] || lhs->shape[3] != rhs->shape[3];
+static void ccml_tensor_print(ccml_tensor * tensor) {
+    if (tensor->data == NULL) {
+        printf("tensor %d: tensor data field is NULL\n", tensor->index);
+    }
+    printf("tensor %d: ", tensor->index);
+    for (int i = 0; i < ccml_size(tensor); i++) {
+        printf("%f ", *((float *)tensor->data + i));
+    }
+    printf("\n");
+}
+
+static bool ccml_is_permute(ccml_tensor * tensor) {
+    return tensor->oper == CCML_OPER_RES || tensor->oper == CCML_OPER_PER;
+}
+
+static bool ccml_is_leaf(ccml_tensor * tensor) {
+    return tensor->src[0] == NULL && tensor->src[1] == NULL;
 }
 
 static bool ccml_has_buffer(ccml_tensor * tensor) {
     return tensor->buff != CCML_BUFF_NONE;
 }
 
-static int ccml_n_dim(ccml_tensor * tensor) {
+static int ccml_ndim(ccml_tensor * tensor) {
     int last_dim = 0;
     for (int i = 0; i < CCML_DIMS_MAX; i++) {
         if(tensor->shape[i] != 1) last_dim = i;
@@ -240,21 +256,21 @@ static int ccml_n_dim(ccml_tensor * tensor) {
 
 static bool ccml_is_vector(ccml_tensor * tensor) {
     return tensor->shape[1] == 1 && tensor->shape[2] == 1 &&
-           tensor->shape[3] == 1;
+        tensor->shape[3] == 1;
 }
 
 static bool ccml_is_matrix(ccml_tensor * tensor) {
     return tensor->shape[0] != 1 && tensor->shape[1] != 1 &&
-           tensor->shape[2] == 1 && tensor->shape[3] == 1;
+        tensor->shape[2] == 1 && tensor->shape[3] == 1;
 }
 
 //
-//   ██████╗ ██████╗ ██████╗ ███████╗
-//  ██╔════╝██╔═══██╗██╔══██╗██╔════╝
-//  ██║     ██║   ██║██████╔╝█████╗
-//  ██║     ██║   ██║██╔══██╗██╔══╝
-//  ╚██████╗╚██████╔╝██║  ██║███████╗
-//   ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
+//  ██████╗ ██████╗ ██╗███╗   ███╗ █████╗ ██████╗ ██╗   ██╗
+//  ██╔══██╗██╔══██╗██║████╗ ████║██╔══██╗██╔══██╗╚██╗ ██╔╝
+//  ██████╔╝██████╔╝██║██╔████╔██║███████║██████╔╝ ╚████╔╝
+//  ██╔═══╝ ██╔══██╗██║██║╚██╔╝██║██╔══██║██╔══██╗  ╚██╔╝
+//  ██║     ██║  ██║██║██║ ╚═╝ ██║██║  ██║██║  ██║   ██║
+//  ╚═╝     ╚═╝  ╚═╝╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝
 //
 //   ██████╗ ██████╗ ███████╗██████╗  █████╗ ████████╗██╗ ██████╗ ███╗   ██╗███████╗
 //  ██╔═══██╗██╔══██╗██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██║██╔═══██╗████╗  ██║██╔════╝
@@ -267,15 +283,15 @@ static bool ccml_is_matrix(ccml_tensor * tensor) {
 #define CCML_UNARY_OPERATION(function, operation)                                              \
 static ccml_tensor * function(ccml_tensor * tensor) {                                          \
     ccml_tensor * result = ccml_new_tensor_impl(tensor->type, tensor->shape);                  \
-                                                                                               \
+                                                                                            \
     for (int i = 0; i < CCML_DIMS_MAX; i++) {                                                  \
         result->stride[i] = tensor->stride[i];                                                 \
     }                                                                                          \
-                                                                                               \
+                                                                                            \
     result->oper = operation;                                                                  \
     result->src[0] = tensor;                                                                   \
-    result->has_grad = tensor->has_grad;                                                       \
-                                                                                               \
+    result->requires_grad = tensor->requires_grad;                                             \
+                                                                                            \
     return result;                                                                             \
 }
 
@@ -286,45 +302,43 @@ CCML_UNARY_OPERATION(ccml_rec, CCML_OPER_REC);
 CCML_UNARY_OPERATION(ccml_sqrt, CCML_OPER_SQRT);
 
 static ccml_tensor * ccml_add(ccml_tensor * lhs, ccml_tensor * rhs) {
-    assert(ccml_can_broadcast(lhs, rhs));
+    assert(ccml_can_broadcast(lhs, rhs) && "incompatible dimensions for broadcasting");
 
     bool null_input = lhs == NULL || rhs == NULL;
-    ccml_tensor * non_null = lhs != NULL ? lhs : rhs;
 
     int shape[CCML_DIMS_MAX] = {0};
     for (int i = 0; i < CCML_DIMS_MAX; i++) {
-        shape[i] = null_input ? non_null->shape[i] :
+        shape[i] = null_input ? lhs->shape[i] :
             (lhs->shape[i] + rhs->shape[i] + abs(lhs->shape[i] - rhs->shape[i])) / 2;
     }
 
     ccml_tensor * result = ccml_new_tensor_impl(lhs->type, shape);
 
     result->oper = CCML_OPER_ADD;
-    result->src[0] = null_input ? result : lhs;
-    result->src[1] = null_input ? non_null : rhs;
-    result->has_grad = null_input ? non_null->has_grad : lhs->has_grad || rhs->has_grad;
+    result->src[0] = lhs;
+    result->src[1] = rhs;
+    result->requires_grad = null_input ? lhs->requires_grad : lhs->requires_grad || rhs->requires_grad;
 
     return result;
 }
 
 static ccml_tensor * ccml_mul(ccml_tensor * lhs, ccml_tensor * rhs) {
-    assert(ccml_can_broadcast(lhs, rhs));
+    assert(ccml_can_broadcast(lhs, rhs) && "incompatible dimensions for broadcasting");
 
     bool null_input = lhs == NULL || rhs == NULL;
-    ccml_tensor * non_null = lhs != NULL ? lhs : rhs;
 
     int shape[CCML_DIMS_MAX] = {0};
     for (int i = 0; i < CCML_DIMS_MAX; i++) {
-        shape[i] = null_input ? non_null->shape[i] :
+        shape[i] = null_input ? lhs->shape[i] :
             (lhs->shape[i] + rhs->shape[i] + abs(lhs->shape[i] - rhs->shape[i])) / 2;
     }
 
     ccml_tensor * result = ccml_new_tensor_impl(lhs->type, shape);
 
     result->oper = CCML_OPER_MUL;
-    result->src[0] = null_input ? result : lhs;
-    result->src[1] = null_input ? non_null : rhs;
-    result->has_grad = null_input ? non_null->has_grad : lhs->has_grad || rhs->has_grad;
+    result->src[0] = lhs;
+    result->src[1] = rhs;
+    result->requires_grad = null_input ? lhs->requires_grad : lhs->requires_grad || rhs->requires_grad;
 
     return result;
 }
@@ -336,32 +350,30 @@ static ccml_tensor * ccml_reshape(ccml_tensor * tensor, int shape[CCML_DIMS_MAX]
 
     ccml_tensor * result = ccml_new_tensor_impl(tensor->type, shape);
 
-    result->oper = CCML_OPER_RESHAPE;
-    result->buff = CCML_BUFF_INTR;
+    result->oper = CCML_OPER_RES;
     result->src[0] = tensor;
-    result->has_grad = tensor->has_grad;
+    result->requires_grad = tensor->requires_grad;
 
     return result;
 }
 
 static ccml_tensor * ccml_permute(ccml_tensor * tensor, int perm[CCML_DIMS_MAX]) {
     ccml_tensor * result = ccml_new_tensor_impl(tensor->type, tensor->shape);
-    int n_dim = ccml_n_dim(tensor);
-    for (int i = 0; i < n_dim; i++) {
+    int ndim = ccml_ndim(tensor);
+    for (int i = 0; i < ndim; i++) {
         result->shape[i] = tensor->shape[perm[i]];
         result->stride[i] = tensor->stride[perm[i]];
     }
 
-    result->oper = CCML_OPER_PERMUTE;
-    result->buff = CCML_BUFF_INTR;
+    result->oper = CCML_OPER_PER;
     result->src[0] = tensor;
-    result->has_grad = tensor->has_grad;
+    result->requires_grad = tensor->requires_grad;
 
     return result;
 }
 
 static ccml_tensor * ccml_sum(ccml_tensor * tensor, int n_axes, int axes[CCML_DIMS_MAX]) {
-    assert(n_axes > 0 && n_axes < CCML_DIMS_MAX);
+    assert(n_axes > 0 && n_axes < CCML_DIMS_MAX && "invalid number of summed axes");
 
     int shape[CCML_DIMS_MAX] = {1, 1, 1, 1};
     for (int i = 0; i < CCML_DIMS_MAX; i++) {
@@ -375,20 +387,19 @@ static ccml_tensor * ccml_sum(ccml_tensor * tensor, int n_axes, int axes[CCML_DI
     ccml_tensor * result = ccml_new_tensor_impl(tensor->type, shape);
 
     result->oper = CCML_OPER_SUM;
-    result->buff = CCML_BUFF_INTR;
     result->src[0] = tensor;
-    result->has_grad = tensor->has_grad;
+    result->requires_grad = tensor->requires_grad;
 
     return result;
 }
 
 //
-//  ███╗   ██╗ ██████╗ ███╗   ██╗       ██████╗ ██████╗ ██████╗ ███████╗
-//  ████╗  ██║██╔═══██╗████╗  ██║      ██╔════╝██╔═══██╗██╔══██╗██╔════╝
-//  ██╔██╗ ██║██║   ██║██╔██╗ ██║█████╗██║     ██║   ██║██████╔╝█████╗
-//  ██║╚██╗██║██║   ██║██║╚██╗██║╚════╝██║     ██║   ██║██╔══██╗██╔══╝
-//  ██║ ╚████║╚██████╔╝██║ ╚████║      ╚██████╗╚██████╔╝██║  ██║███████╗
-//  ╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═══╝       ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
+//  ███████╗███████╗ ██████╗ ██████╗ ███╗   ██╗██████╗  █████╗ ██████╗ ██╗   ██╗
+//  ██╔════╝██╔════╝██╔════╝██╔═══██╗████╗  ██║██╔══██╗██╔══██╗██╔══██╗╚██╗ ██╔╝
+//  ███████╗█████╗  ██║     ██║   ██║██╔██╗ ██║██║  ██║███████║██████╔╝ ╚████╔╝
+//  ╚════██║██╔══╝  ██║     ██║   ██║██║╚██╗██║██║  ██║██╔══██║██╔══██╗  ╚██╔╝
+//  ███████║███████╗╚██████╗╚██████╔╝██║ ╚████║██████╔╝██║  ██║██║  ██║   ██║
+//  ╚══════╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝
 //
 //   ██████╗ ██████╗ ███████╗██████╗  █████╗ ████████╗██╗ ██████╗ ███╗   ██╗███████╗
 //  ██╔═══██╗██╔══██╗██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██║██╔═══██╗████╗  ██║██╔════╝
@@ -398,12 +409,18 @@ static ccml_tensor * ccml_sum(ccml_tensor * tensor, int n_axes, int axes[CCML_DI
 //   ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
 //
 
+typedef enum ccml_oper_misc {
+    CCML_OPER_MISC_NEG = 11,
+    CCML_OPER_MISC_SUB,
+    CCML_OPER_MISC_DIV,
+    CCML_OPER_MISC_SQR,
+    CCML_OPER_MISC_COS,
+    CCML_OPER_MISC_TANH,
+    CCML_OPER_MISC_MMUL,
+} ccml_oper_misc;
+
 static ccml_tensor * ccml_neg(ccml_tensor * tensor) {
     return ccml_log(ccml_rec(ccml_exp(tensor)));
-}
-
-static ccml_tensor * ccml_square(ccml_tensor * tensor) {
-    return ccml_mul(tensor, tensor);
 }
 
 static ccml_tensor * ccml_sub(ccml_tensor * lhs, ccml_tensor * rhs) {
@@ -414,9 +431,13 @@ static ccml_tensor * ccml_div(ccml_tensor * lhs, ccml_tensor * rhs) {
     return ccml_mul(lhs, ccml_rec(rhs));
 }
 
+static ccml_tensor * ccml_square(ccml_tensor * tensor) {
+    return ccml_mul(tensor, tensor);
+}
+
 static ccml_tensor * ccml_cos(ccml_tensor * tensor) {
-    ccml_tensor * pi_2 = ccml_new_tensor_1d(tensor->type, 1, false);
-    ccml_tensor_set(pi_2, (float[]){M_PI_2});
+    ccml_tensor * pi_2 = ccml_new_tensor_impl(tensor->type, (int[]){1, 1, 1, 1});
+    ccml_fill(pi_2, M_PI_2);
 
     return ccml_sin(ccml_add(tensor, pi_2));
 }
@@ -427,8 +448,8 @@ static ccml_tensor * ccml_tanh(ccml_tensor * tensor) {
 }
 
 static ccml_tensor * ccml_matmul(ccml_tensor * lhs, ccml_tensor * rhs) {
-    assert(ccml_is_matrix(lhs));
-    assert(ccml_is_matrix(rhs));
+    assert(ccml_is_matrix(lhs) && "tensor must be a matrix for matmul");
+    assert(ccml_is_matrix(rhs) && "tensor must be a matrix for matmul");
 
     assert(lhs->shape[1] == rhs->shape[0]);
 
@@ -460,7 +481,7 @@ typedef struct ccml_hashmap_entry {
 
 typedef struct ccml_hashmap {
     int used;
-    ccml_hashmap_entry * entries;
+    ccml_hashmap_entry entries[CCML_NODE_MAX];
     int capacity;
 } ccml_hashmap;
 
@@ -477,7 +498,7 @@ static ccml_hashmap * ccml_new_hashmap() {
     ccml_hashmap * map = malloc(sizeof(ccml_hashmap));
     *map = (ccml_hashmap){
         .used = 0,
-        .entries = malloc(sizeof(ccml_hashmap_entry) * capacity),
+        .entries = {0},
         .capacity = capacity,
     };
 
@@ -554,20 +575,21 @@ typedef struct ccml_graph {
 } ccml_graph;
 
 static void ccml_graph_forward(struct ccml_graph * graph, ccml_tensor * tensor,
-                               int * node_counter) {
+                            int * node_counter) {
     if (tensor == NULL) return;
 
     // also checking if tensor has itself as a child to prevent (infinite)
     // cycles
 
-    if (tensor != tensor->src[0] && ccml_hashmap_get(graph->map, tensor->src[0]) == -1) {
+    if (ccml_hashmap_get(graph->map, tensor->src[0]) == -1) {
         ccml_graph_forward(graph, tensor->src[0], node_counter);
     }
-    if (tensor != tensor->src[1] && ccml_hashmap_get(graph->map, tensor->src[1]) == -1) {
+    if (ccml_hashmap_get(graph->map, tensor->src[1]) == -1) {
         ccml_graph_forward(graph, tensor->src[1], node_counter);
     }
 
     if (ccml_hashmap_get(graph->map, tensor) == -1) {
+        assert(*node_counter < CCML_NODE_MAX - 1 && "more nodes created than CCML_NODE_MAX");
         tensor->index = *node_counter;
         graph->nodes[*node_counter] = tensor;
         ccml_hashmap_set(graph->map, tensor, (*node_counter)++);
@@ -575,7 +597,9 @@ static void ccml_graph_forward(struct ccml_graph * graph, ccml_tensor * tensor,
 }
 
 static void ccml_graph_backward(ccml_graph * graph, ccml_tensor * root) {
-    if (root->has_grad == false) return;
+    if (root->requires_grad == false) return;
+    root->grad = ccml_new_tensor_impl(root->type, root->shape);
+    ccml_fill(root->grad, 1.0f);
 
     // in this loop create gradient tensors corresponding to each tensor
     // that requires gradient tracking, and set their buffers to the correct
@@ -589,26 +613,24 @@ static void ccml_graph_backward(ccml_graph * graph, ccml_tensor * root) {
 
     while (queue_end != queue_start) {
         ccml_tensor * tensor = queue[queue_start++];
-        if (tensor->has_grad == true) {
-            // processing node here
-
+        if (tensor->requires_grad == true) {
             // declaring partials d(tensor)/d(tensor->src[0]) and
             // d(tensor)/d(tensor->src[1])
 
-            ccml_tensor * partial_0 = NULL;
-            ccml_tensor * partial_1 = NULL;
+            ccml_tensor * one = ccml_new_tensor_impl(tensor->type, (int[]){1, 1, 1, 1});
+            ccml_tensor * two = ccml_new_tensor_impl(tensor->type, (int[]){1, 1, 1, 1});
 
-            ccml_tensor * one = ccml_new_tensor_1d(tensor->type, 1, false);
-            ccml_tensor * two = ccml_new_tensor_1d(tensor->type, 1, false);
+            ccml_fill(one, 1.0f);
+            ccml_fill(two, 2.0f);
 
-            ccml_tensor_set(one, (float[]){1.0f});
-            ccml_tensor_set(two, (float[]){2.0f});
+            ccml_tensor * partial_0 = one;
+            ccml_tensor * partial_1 = one;
 
             // calculating partials
 
             switch (tensor->oper) {
                 case CCML_OPER_NONE:
-                    break;
+                    partial_0 = one; break;
                 case CCML_OPER_LOG:
                     partial_0 = ccml_rec(tensor->src[0]); break;
                 case CCML_OPER_EXP:
@@ -623,9 +645,9 @@ static void ccml_graph_backward(ccml_graph * graph, ccml_tensor * root) {
                     partial_0 = one; partial_1 = one; break;
                 case CCML_OPER_MUL:
                     partial_0 = tensor->src[1]; partial_1 = tensor->src[0]; break;
-                case CCML_OPER_RESHAPE:
+                case CCML_OPER_RES:
                     partial_0 = one; break;
-                case CCML_OPER_PERMUTE:
+                case CCML_OPER_PER:
                     partial_0 = one; break;
                 case CCML_OPER_SUM:
                     partial_0 = one; break;
@@ -640,12 +662,22 @@ static void ccml_graph_backward(ccml_graph * graph, ccml_tensor * root) {
             // versed separately)
 
             if (tensor->src[0] != NULL) {
-                tensor->src[0]->grad = ccml_add(ccml_mul(tensor->grad, partial_0), NULL);
+                if (ccml_is_leaf(tensor->src[0])) {
+                    tensor->src[0]->grad = ccml_add(ccml_mul(tensor->grad, partial_0), tensor->src[0]->grad);
+                } else {
+                    tensor->src[0]->grad = ccml_mul(ccml_mul(tensor->grad, partial_0), tensor->src[0]->grad);
+                }
+                ccml_fill(tensor->src[0]->grad, 1.0f);
                 ccml_graph_forward(graph, tensor->src[0]->grad, &graph->n_nodes);
                 queue[queue_end++] = tensor->src[0];
             }
             if (tensor->src[1] != NULL) {
-                tensor->src[1]->grad = ccml_add(ccml_mul(tensor->grad, partial_1), NULL);
+                if (ccml_is_leaf(tensor->src[1])) {
+                    tensor->src[1]->grad = ccml_add(ccml_mul(tensor->grad, partial_1), tensor->src[1]->grad);
+                } else {
+                    tensor->src[1]->grad = ccml_mul(ccml_mul(tensor->grad, partial_1), tensor->src[1]->grad);
+                }
+                ccml_fill(tensor->src[1]->grad, 1.0f);
                 ccml_graph_forward(graph, tensor->src[1]->grad, &graph->n_nodes);
                 queue[queue_end++] = tensor->src[1];
             }
@@ -653,34 +685,57 @@ static void ccml_graph_backward(ccml_graph * graph, ccml_tensor * root) {
     }
 }
 
-static void ccml_graph_node_buffers(struct ccml_graph * graph) {
+static void ccml_graph_allocate_nodes(ccml_graph * graph) {
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
         int size = ccml_size(tensor);
-
         if (ccml_has_buffer(tensor) && tensor->data == NULL) {
             tensor->data = malloc(size * ccml_type_sizes[tensor->type]);
-            if (tensor->grad != NULL && tensor->grad->data == NULL) {
-                tensor->grad->buff = CCML_BUFF_SAVE;
-                tensor->grad->data = malloc(size * ccml_type_sizes[tensor->type]);
+        }
+        if (tensor->buff == CCML_BUFF_PERM && tensor->grad != NULL) {
+            tensor->grad->buff = CCML_BUFF_PERM;
+            tensor->grad->data = malloc(size * ccml_type_sizes[tensor->type]);
+        }
+    }
+}
+
+// common subexpression elimination
+static void ccml_graph_cse(ccml_graph * graph) {
+    // an expression takes the following format
+    // (oper-int) * 10^8 + (src0-index) * 10^4 + (src1-index)
+
+    assert(CCML_NODE_MAX < 9999 && "ccml_graph_cse must be adjusted w/ the increased node count");
+
+    // erasing graph->map hashmap
+    for (int i = 0; i < graph->map->capacity; i++) {
+        graph->map->used = 0;
+        graph->map->entries[i].key = 0;
+        graph->map->entries[i].value = -1;
+    }
+
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ccml_tensor * tensor = graph->nodes[i];
+        if (ccml_is_leaf(tensor) == false) {
+            int operation = tensor->oper;
+            int src_0 = tensor->src[0] == NULL ? CCML_NODE_MAX : tensor->src[0]->index;
+            int src_1 = tensor->src[1] == NULL ? CCML_NODE_MAX : tensor->src[1]->index;
+            int expression = operation * pow(10, 8) + src_0 * pow(10, 4) + src_1;
+
+            if (ccml_hashmap_get(graph->map, (void *)(uintptr_t)expression) == -1) {
+                ccml_hashmap_set(graph->map, (void *)(uintptr_t)expression, tensor->index);
+            } else {
+                int index = ccml_hashmap_get(graph->map, (void *)(uintptr_t)expression);
+                tensor->src[0] = graph->nodes[index];
+                tensor->src[1] = NULL;
+                tensor->oper = CCML_OPER_NONE;
             }
         }
     }
 }
 
-// clang-format off
-
 static ccml_graph * ccml_new_graph(ccml_tensor * root) {
-    root->data = malloc(ccml_size(root) * sizeof(ccml_type_sizes[root->type]));
-    root->buff = CCML_BUFF_SAVE;
-
-    if (root->has_grad == true) {
-        ccml_tensor * grad = ccml_new_tensor_1d(root->type, 1, false);
-        ccml_tensor_ones(grad);
-        root->grad = grad;
-    }
-
     struct ccml_graph * graph = malloc(sizeof(struct ccml_graph));
+    root->buff = CCML_BUFF_PERM;
 
     *graph = (struct ccml_graph){
         /*.n_nodes =*/ 0,
@@ -691,26 +746,20 @@ static ccml_graph * ccml_new_graph(ccml_tensor * root) {
     ccml_graph_forward(graph, root, &graph->n_nodes);
     ccml_graph_backward(graph, root);
 
-    ccml_graph_node_buffers(graph);
+    ccml_graph_cse(graph);
+    ccml_graph_allocate_nodes(graph);
 
     return graph;
 };
 
-// clang-format on
-
 static void ccml_graph_free(ccml_graph * graph) {
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
-
         // only freeing when tensor isn't of type reshape/permute, because those tensors
         // just use their children's data pointer, so we avoid a double free this way :)
-        if (tensor->oper != CCML_OPER_RESHAPE && tensor->oper != CCML_OPER_PERMUTE) {
-            free(tensor->data);
-        }
-
+        free(tensor->data);
         free(tensor);
     }
-
     free(graph);
 }
 
@@ -723,24 +772,23 @@ static void ccml_graph_free(ccml_graph * graph) {
 //  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝ ╚═════╝╚══════╝╚══════╝
 //
 
-// both reduction and broadcasting index functions look terrible, there has to be a cleaner
-// and concise way to express this
-
 #define ccml_index(tensor, condition) ({                                         \
     int size = CCML_CHAR_MAX * CCML_DIMS_MAX;                                    \
     char * result = malloc(size * sizeof(char));                                 \
     *result = '\0';                                                              \
     strncat(result, "[", size);                                                  \
-                                                                                 \
-    for (int i = 0; i < ccml_n_dim(tensor); i++) {                               \
+                                                                                \
+    for (int i = 0; i < ccml_ndim(tensor); i++) {                                \
         snprintf(result + strlen(result), size - strlen(result), "%sid%d*%d*%d", \
-                 i != 0 && i != ccml_n_dim(tensor) ? "+" : "", i,                \
-                 tensor->stride[i], (condition) ? 1 : 0);                        \
+                i != 0 && i != ccml_ndim(tensor) ? "+" : "", i,                 \
+                tensor->stride[i], (condition) ? 1 : 0);                        \
     }                                                                            \
-                                                                                 \
+                                                                                \
     strncat(result + strlen(result), "]", size - strlen(result));                \
-    if (ccml_has_buffer(tensor) == false) snprintf(result, size, "");            \
-                                                                                 \
+    if ((!ccml_has_buffer(tensor) && !ccml_is_permute(tensor)) ||                \
+        ccml_size(tensor) == 1) {                                               \
+        snprintf(result, size, "");                                              \
+    }                                                                            \
     result;                                                                      \
 })
 
@@ -752,59 +800,44 @@ static void ccml_graph_free(ccml_graph * graph) {
 //  ██████╔╝██║  ██║╚██████╗██║  ██╗███████╗██║ ╚████║██████╔╝
 //  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═════╝
 //
-//   ██████╗██╗   ██╗██████╗  █████╗
-//  ██╔════╝██║   ██║██╔══██╗██╔══██╗
-//  ██║     ██║   ██║██║  ██║███████║
-//  ██║     ██║   ██║██║  ██║██╔══██║
-//  ╚██████╗╚██████╔╝██████╔╝██║  ██║
-//   ╚═════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝
+//   ██████╗ ██████╗ ███████╗███╗   ██╗ ██████╗██╗
+//  ██╔═══██╗██╔══██╗██╔════╝████╗  ██║██╔════╝██║
+//  ██║   ██║██████╔╝█████╗  ██╔██╗ ██║██║     ██║
+//  ██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║██║     ██║
+//  ╚██████╔╝██║     ███████╗██║ ╚████║╚██████╗███████╗
+//   ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚══════╝
 //
 
-static const char * ccml_oper_to_string_cuda(ccml_oper oper) {
+static const char * ccml_oper_metal(ccml_oper oper) {
     switch (oper) {
-        case CCML_OPER_LOG:
-            return "log";
-        case CCML_OPER_EXP:
-            return "exp";
-        case CCML_OPER_SIN:
-            return "sin";
-        case CCML_OPER_REC:
-            return "1/";
-        case CCML_OPER_SQRT:
-            return "sqrt";
-        case CCML_OPER_ADD:
-            return "+";
-        case CCML_OPER_MUL:
-            return "*";
-        default:
-            assert(false && "no meaningful conversion to string exists");
+        case CCML_OPER_LOG: return "log";
+        case CCML_OPER_EXP: return "exp";
+        case CCML_OPER_SIN: return "sin";
+        case CCML_OPER_REC: return "1/";
+        case CCML_OPER_SQRT: return "sqrt";
+        case CCML_OPER_ADD: return "+";
+        case CCML_OPER_MUL: return "*";
+        default: assert(false && "no meaningful conversion to string exists");
     }
 }
 
-static const char * ccml_type_to_string_cuda(ccml_type type) {
+static const char * ccml_type_metal(ccml_type type) {
     switch (type) {
-        case CCML_TYPE_FP16:
-            return "__half ";
-        case CCML_TYPE_FP32:
-            return "float ";
-        case CCML_TYPE_FP64:
-            return "double ";
-        default:
-            assert(false && "unknown variant of ccml_type");
+        case CCML_TYPE_FP32: return "float ";
+        default: assert(false && "unknown variant of ccml_type");
     }
 }
 
-static const char * ccml_parser_cuda(struct ccml_graph * graph) {
+static const char * ccml_kernel_metal(struct ccml_graph * graph) {
     int size = CCML_NODE_MAX * CCML_CHAR_MAX;
     char * kernel = malloc(size * sizeof(char));
     char * string = kernel;
     *string = '\0';
 
-    // adding includes and kernel function signature to the
-    // kernel string
-
-    string += snprintf(string, size - (kernel - string), "#include <cuda_fp16.h>\n"
-                       "\n__global__ void ccml_kernel(");
+    // atomic floating point addition function bc metal doesn't support it natively
+    string += snprintf(string, size - (kernel - string),
+                    "#include <metal_stdlib>\n#include <metal_atomic>\n"
+                    "using namespace metal;\n\nkernel void my_kernel(");
 
     // adding kernel input parameters to the kernel string
 
@@ -816,38 +849,42 @@ static const char * ccml_parser_cuda(struct ccml_graph * graph) {
         if (ccml_size(tensor) > ccml_size(graph->nodes[largest_tensor]))
             largest_tensor = i;
 
-        if (tensor->buff != CCML_BUFF_NONE && ccml_size(tensor) != 1) {
+        if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
+            if (tensor->oper == CCML_OPER_SUM) {}
             if (n_kernel_parameters == 0) {
-                string += snprintf(string, size - (kernel - string), "%s* data_%d",
-                                   ccml_type_to_string_cuda(tensor->type), i);
+                string += snprintf(string, size - (kernel - string), "device %s%s* data_%d [[buffer(0)]]",
+                                tensor->oper == CCML_OPER_SUM ? "atomic_" : "", ccml_type_metal(tensor->type), i);
                 n_kernel_parameters++;
             } else {
-                string += snprintf(string, size - (kernel - string), ", %s* data_%d",
-                                   ccml_type_to_string_cuda(tensor->type), i);
+                string += snprintf(string, size - (kernel - string), ", device %s%s* data_%d [[buffer(%d)]]",
+                                tensor->oper == CCML_OPER_SUM ? "atomic_" : "",
+                                ccml_type_metal(tensor->type), i, n_kernel_parameters);
                 n_kernel_parameters++;
             }
         }
     }
 
-    string += snprintf(string, size - (kernel - string), ") {\n"
-                       "\tint id0 = blockIdx.x * blockDim.x + threadIdx.x; /* %d */\n"
-                       "\tint id1 = blockIdx.y * blockDim.y + threadIdx.y; /* %d */\n"
-                       "\tint id2 = blockIdx.z * blockDim.z + threadIdx.z; /* %d */\n"
-                       "\tfor (int id3 = 0; id3 < %d; id3++) {\n",
-                       graph->nodes[largest_tensor]->shape[0],
-                       graph->nodes[largest_tensor]->shape[1],
-                       graph->nodes[largest_tensor]->shape[2],
-                       graph->nodes[largest_tensor]->shape[3]);
+    string += snprintf(string, size - (kernel - string),
+                    ", uint3 gid [[thread_position_in_grid]]) {\n"
+                    "\tuint id0 = gid.x / %d;\n\tuint id1 = gid.x %% %d;\n"
+                    "\tuint id2 = gid.y;\n\tuint id3 = gid.z;\n\n",
+                    graph->nodes[0]->shape[1], graph->nodes[0]->shape[1]);
 
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
 
         switch (tensor->oper) {
             case CCML_OPER_NONE:
+                if (ccml_is_leaf(tensor) == false) {
+                    string += snprintf(string, size - (kernel - string), "\t%s%s data_%d%s = data_%d%s;\n",
+                                    ccml_type_metal(tensor->type), ccml_has_buffer(tensor) ? "*" : "",
+                                    tensor->index, ccml_index(tensor, true), tensor->src[0]->index,
+                                    ccml_index(tensor->src[0], true));
+                }
                 // tensor data is embeddeable directly into the kernel string
-                if (ccml_size(tensor) == 1) {
-                    string += snprintf(string, size - (kernel - string), "\t\t%sdata_%d = %f;\n",
-                                       ccml_type_to_string_cuda(tensor->type), i, *(float *)tensor->data);
+                if (ccml_has_buffer(tensor) && ccml_size(tensor) == 1) {
+                    string += snprintf(string, size - (kernel - string), "\t%sdata_%d = %f;\n",
+                                    ccml_type_metal(tensor->type), i, *(float *)tensor->data);
                 }
                 break;
             case CCML_OPER_LOG:
@@ -855,44 +892,156 @@ static const char * ccml_parser_cuda(struct ccml_graph * graph) {
             case CCML_OPER_SIN:
             case CCML_OPER_REC:
             case CCML_OPER_SQRT:
-                string += snprintf(string, size - (kernel - string), "\t\t%sdata_%d%s = ",
-                                   ccml_has_buffer(tensor) ? "" : ccml_type_to_string_cuda(tensor->type),
-                                   tensor->index, ccml_index(tensor, true));
+                string += snprintf(string, size - (kernel - string), "\t%sdata_%d%s = ",
+                                ccml_has_buffer(tensor) ? "" : ccml_type_metal(tensor->type),
+                                tensor->index, ccml_index(tensor, true));
                 string += snprintf(string, size - (kernel - string), "%s(data_%d%s);\n",
-                                   ccml_oper_to_string_cuda(tensor->oper),
-                                   tensor->src[0]->index, ccml_index(tensor->src[0], true));
+                                ccml_oper_metal(tensor->oper),
+                                tensor->src[0]->index, ccml_index(tensor->src[0], true));
                 break;
             case CCML_OPER_ADD:
             case CCML_OPER_MUL:
-                string += snprintf(string, size - (kernel - string), "\t\t%sdata_%d%s = ",
-                                   ccml_has_buffer(tensor) ? "" : ccml_type_to_string_cuda(tensor->type),
-                                   tensor->index, ccml_index(tensor, true));
+                string += snprintf(string, size - (kernel - string), "\t%sdata_%d%s = ",
+                                ccml_has_buffer(tensor) ? "" : ccml_type_metal(tensor->type),
+                                tensor->index, ccml_index(tensor, true));
                 string += snprintf(string, size - (kernel - string), "data_%d%s %s ",
-                                   tensor->src[0]->index, ccml_index(tensor->src[0], tensor->src[0]->shape[i] != 1),
-                                   ccml_oper_to_string_cuda(tensor->oper));
+                                tensor->src[0]->index, ccml_index(tensor->src[0], tensor->src[0]->shape[i] != 1),
+                                ccml_oper_metal(tensor->oper));
                 string += snprintf(string, size - (kernel - string), "data_%d%s;\n",
-                                   tensor->src[1]->index, ccml_index(tensor->src[1], tensor->src[1]->shape[i] != 1));
+                                tensor->src[1] != NULL ? tensor->src[1]->index : tensor->index,
+                                tensor->src[1] != NULL ? ccml_index(tensor->src[1], tensor->src[1]->shape[i] != 1) :
+                                ccml_index(tensor, true));
                 break;
-            case CCML_OPER_RESHAPE:
-            case CCML_OPER_PERMUTE:
-                string += snprintf(string, size - (kernel - string), "\t\t%s* data_%d = ",
-                                   ccml_type_to_string_cuda(tensor->type), tensor->index);
+            case CCML_OPER_RES:
+            case CCML_OPER_PER:
+                string += snprintf(string, size - (kernel - string), "\t%s* data_%d = ",
+                                ccml_type_metal(tensor->type), tensor->index);
                 string += snprintf(string, size - (kernel - string), "data_%d;\n",
-                                   tensor->src[0]->index);
+                                tensor->src[0]->index);
                 break;
             case CCML_OPER_SUM:
-                string += snprintf(string, size - (kernel - string), "\t\tdata_%d%s += ",
-                                   tensor->index, ccml_index(tensor, tensor->shape[i] != 1));
-                string += snprintf(string, size - (kernel - string), "data_%d%s;\n",
-                                   tensor->src[0]->index, ccml_index(tensor->src[0], tensor->shape[i] != tensor->src[0]->shape[i]));
+                string += snprintf(string, size - (kernel - string),
+                                "\tatomic_fetch_add_explicit(&data_%d%s, ",
+                                tensor->index, ccml_index(tensor, tensor->shape[i] != 1));
+                string += snprintf(string, size - (kernel - string), "data_%d%s, memory_order_relaxed);\n",
+                                tensor->src[0]->index,
+                                ccml_index(tensor->src[0], tensor->shape[i] != tensor->src[0]->shape[i]));
                 break;
             default: assert(false && "unknown variant of ccml_oper");
         }
     }
 
-    // adding the closing braces/brackets :)
-    string += snprintf(string, size - (kernel - string), "\t}\n}");
+    string += snprintf(string, size - (kernel - string), "}");
     return kernel;
+}
+
+static void ccml_code_metal(ccml_graph * graph) {
+    FILE * file_ptr = fopen("metal.m", "w");
+    assert(file_ptr != NULL && "failed to create file for metal source");
+
+    FILE * file_kernel_ptr = fopen("kernel.metal", "w");
+    assert(file_kernel_ptr != NULL && "failed to create a file for kernel source");
+
+    fprintf(file_kernel_ptr, "%s", ccml_kernel_metal(graph));
+
+    fprintf(file_ptr, "#import <MetalKit/MetalKit.h>\n"
+                    "#import <Foundation/Foundation.h>\n\n"
+                    "int main(int argc, const char * argv[]) {\n"
+                    "\t@autoreleasepool {\n"
+                    "\t\t// setup\n"
+                    "\t\tid<MTLDevice> device = MTLCreateSystemDefaultDevice();\n"
+                    "\t\tid<MTLCommandQueue> commandQueue = [device newCommandQueue];\n"
+                    "\t\tid<MTLLibrary> library = [device newDefaultLibrary];\n"
+                    "\t\tid<MTLFunction> kernelFunction = [library newFunctionWithName:@\"my_kernel\"];\n\n"
+                    "\t\t// pipeline\n"
+                    "\t\tNSError *error = NULL;\n"
+                    "\t\t[commandQueue commandBuffer];\n"
+                    "\t\tid<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];\n"
+                    "\t\tid<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];\n"
+                    "\t\t[encoder setComputePipelineState:[device newComputePipelineStateWithFunction:kernelFunction error:&error]];\n\n");
+
+    int buffer_counter = 0;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ccml_tensor * tensor = graph->nodes[i];
+        if (tensor->buff == CCML_BUFF_CNST && ccml_size(tensor) != 1) {
+            fprintf(file_ptr, "\t\t%sbuff_%d[%d] = {%f",
+                    ccml_type_metal(tensor->type), tensor->index, ccml_size(tensor), *((float*)tensor->data));
+            for (int j = 1; j < ccml_size(tensor); j++) {
+                fprintf(file_ptr, ", %f", *((float*)tensor->data + j));
+            }
+            fprintf(file_ptr, "};\n");
+            fprintf(file_ptr, "\t\t[encoder setBuffer:[device newBufferWithBytes:buff_%d length:%d * sizeof(%s) options:0] offset:0 atIndex:%d];\n\n",
+                            tensor->index, ccml_size(tensor), ccml_type_metal(tensor->type), buffer_counter++);
+
+        }
+        if (tensor->buff == CCML_BUFF_PERM) {
+            fprintf(file_ptr, "\t\tid<MTLBuffer> data_%d = [device newBufferWithLength:%d * sizeof(%s) options:0];\n"
+                            "\t\t[encoder setBuffer:data_%d offset:0 atIndex:%d];\n",
+                            tensor->index, ccml_size(tensor), ccml_type_metal(tensor->type), tensor->index, buffer_counter++);
+        }
+    }
+
+    fprintf(file_ptr, "\n\t\tMTLSize numThreadgroups = {%d, %d, %d};\n"
+                    "\t\tMTLSize numgroups = {1,1,1};\n"
+                    "\t\t[encoder dispatchThreadgroups:numThreadgroups threadsPerThreadgroup:numgroups];\n"
+                    "\t\t[encoder endEncoding];\n"
+                    "\t\t[commandBuffer commit];\n"
+                    "\t\t[commandBuffer waitUntilCompleted];\n\n",
+                    graph->nodes[0]->shape[0] * graph->nodes[0]->shape[1],
+                    graph->nodes[0]->shape[2], graph->nodes[0]->shape[3]);
+
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ccml_tensor * tensor = graph->nodes[i];
+        if (tensor->buff == CCML_BUFF_PERM) {
+            fprintf(file_ptr, "\t\t%s* buff_%d = [data_%d contents];\n\n", ccml_type_metal(tensor->type), tensor->index, tensor->index);
+            fprintf(file_ptr, "\t\tfor (int i = 0; i < %d; i++) {\n"
+                            "\t\t\tprintf(\"%%f \", buff_%d[i]);\n\t\t}\n",
+                            ccml_size(tensor), tensor->index);
+        }
+    }
+
+    fprintf(file_ptr, "\n\t}\n\treturn 0;\n}");
+
+    fclose(file_ptr);
+    fclose(file_kernel_ptr);
+}
+
+//
+//  ███████╗██╗  ██╗███████╗ ██████╗██╗   ██╗████████╗██╗ ██████╗ ███╗   ██╗
+//  ██╔════╝╚██╗██╔╝██╔════╝██╔════╝██║   ██║╚══██╔══╝██║██╔═══██╗████╗  ██║
+//  █████╗   ╚███╔╝ █████╗  ██║     ██║   ██║   ██║   ██║██║   ██║██╔██╗ ██║
+//  ██╔══╝   ██╔██╗ ██╔══╝  ██║     ██║   ██║   ██║   ██║██║   ██║██║╚██╗██║
+//  ███████╗██╔╝ ██╗███████╗╚██████╗╚██████╔╝   ██║   ██║╚██████╔╝██║ ╚████║
+//  ╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝    ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
+//
+
+static void ccml_graph_execute(ccml_graph * graph, ccml_backend backend) {
+    // currently only macos and linux are supported
+    #if !defined(__APPLE__)
+        #error "platform not supported"
+    #endif
+
+    switch(backend) {
+        case CCML_BACKEND_METAL: ccml_code_metal(graph); break;
+        default: assert(false && "unknown backend");
+    }
+
+    // reading tensors back from their respective files
+    /*
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ccml_tensor * tensor = graph->nodes[i];
+        if (tensor->buff == CCML_BUFF_PERM) {
+            char file_name[CCML_CHAR_MAX];
+            snprintf(file_name, CCML_CHAR_MAX, "tensor_%d", tensor->index);
+            FILE * file_ptr = fopen(file_name, "rb");
+            assert(file_ptr != NULL && "couldn't open file with tensor data");
+            fread(tensor->data, ccml_size(tensor), ccml_type_sizes[tensor->type], file_ptr);
+            char command[CCML_CHAR_MAX] = "rm ";
+            strncat(command, file_name, CCML_CHAR_MAX);
+            system(command);
+        }
+    }
+    */
 }
 
 #endif

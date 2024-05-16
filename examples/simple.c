@@ -7,8 +7,8 @@ int main() {
     ccml_tensor * y = ccml_sin(ccml_log(x));
     // create computational graph
     ccml_graph * graph = ccml_new_graph(y);
-    // generate compute kernel
-    const char * kernel = ccml_parser_cuda(graph);
+    // execute the graph
+    ccml_graph_execute(graph, CCML_BACKEND_METAL);s
     // free the memory :)
     ccml_graph_free(graph);
 }    

@@ -3,4 +3,5 @@
     automatic differentiation library in C.<br/><br/>
 </p>
 
-ccml is inspired by libraries like tinygrad and luminal that define complex operations in terms of a set of primitive operations, enabling aggressive operation fusion, automatic compute kernel generation, and more, check out examples folder for usage scenarios
+ccml is inspired by tinygrad/luminal in defining complex operations in terms of a small set of primitive operations, allowing for automatic GPU code generation and kernel fusion, powerful graph optimisations, and more, check out the examples folder :)
+
