@@ -387,6 +387,7 @@ static ccml_tensor * ccml_sum(ccml_tensor * tensor, int n_axes, int axes[CCML_DI
     ccml_tensor * result = ccml_new_tensor_impl(tensor->type, shape);
 
     result->oper = CCML_OPER_SUM;
+    result->buff = CCML_BUFF_PERM;
     result->src[0] = tensor;
     result->requires_grad = tensor->requires_grad;
 
@@ -914,7 +915,7 @@ static const char * ccml_kernel_metal(struct ccml_graph * graph) {
                 break;
             case CCML_OPER_RES:
             case CCML_OPER_PER:
-                string += snprintf(string, size - (kernel - string), "\t%s* data_%d = ",
+                string += snprintf(string, size - (kernel - string), "\tdevice %s* data_%d = ",
                                 ccml_type_metal(tensor->type), tensor->index);
                 string += snprintf(string, size - (kernel - string), "data_%d;\n",
                                 tensor->src[0]->index);
@@ -936,7 +937,7 @@ static const char * ccml_kernel_metal(struct ccml_graph * graph) {
 }
 
 static void ccml_code_metal(ccml_graph * graph) {
-    FILE * file_ptr = fopen("metal.m", "w");
+    FILE * file_ptr = fopen("metal.swift", "w");
     assert(file_ptr != NULL && "failed to create file for metal source");
 
     FILE * file_kernel_ptr = fopen("kernel.metal", "w");
@@ -944,67 +945,74 @@ static void ccml_code_metal(ccml_graph * graph) {
 
     fprintf(file_kernel_ptr, "%s", ccml_kernel_metal(graph));
 
-    fprintf(file_ptr, "#import <MetalKit/MetalKit.h>\n"
-                    "#import <Foundation/Foundation.h>\n\n"
-                    "int main(int argc, const char * argv[]) {\n"
-                    "\t@autoreleasepool {\n"
-                    "\t\t// setup\n"
-                    "\t\tid<MTLDevice> device = MTLCreateSystemDefaultDevice();\n"
-                    "\t\tid<MTLCommandQueue> commandQueue = [device newCommandQueue];\n"
-                    "\t\tid<MTLLibrary> library = [device newDefaultLibrary];\n"
-                    "\t\tid<MTLFunction> kernelFunction = [library newFunctionWithName:@\"my_kernel\"];\n\n"
-                    "\t\t// pipeline\n"
-                    "\t\tNSError *error = NULL;\n"
-                    "\t\t[commandQueue commandBuffer];\n"
-                    "\t\tid<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];\n"
-                    "\t\tid<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];\n"
-                    "\t\t[encoder setComputePipelineState:[device newComputePipelineStateWithFunction:kernelFunction error:&error]];\n\n");
+    // metal imports
+    fprintf(file_ptr, "import MetalKit\n"
+                       "func createBuffer(device: MTLDevice, array: [Float]) -> MTLBuffer {\n"
+                       "\treturn device.makeBuffer(bytes: array, length: array.count * MemoryLayout<Float>.size, options: [])!\n"
+                       "}\n\n");
 
-    int buffer_counter = 0;
+    // metal setup and pipeline
+    fprintf(file_ptr, "let device = MTLCreateSystemDefaultDevice()!\n"
+                       "let commandQueue = device.makeCommandQueue()!\n"
+                       "let library = try! device.makeLibrary(filepath: \"kernel.metallib\")\n"
+                       "let function = library.makeFunction(name: \"my_kernel\")!\n"
+                       "let computePipelineState = try! device.makeComputePipelineState(function: function)\n"
+                       "let commandBuffer = commandQueue.makeCommandBuffer()!\n"
+                       "let computeEncoder = commandBuffer.makeComputeCommandEncoder()!\n"
+                       "computeEncoder.setComputePipelineState(computePipelineState)\n\n");
+
+    // buffers setup
+    int parameter_counter = 0;
+    int largest_shape[CCML_DIMS_MAX] = {1, 1, 1, 1};
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
-        if (tensor->buff == CCML_BUFF_CNST && ccml_size(tensor) != 1) {
-            fprintf(file_ptr, "\t\t%sbuff_%d[%d] = {%f",
-                    ccml_type_metal(tensor->type), tensor->index, ccml_size(tensor), *((float*)tensor->data));
+
+        largest_shape[0] = largest_shape[0] > tensor->shape[0] ? largest_shape[0] : tensor->shape[0];
+        largest_shape[1] = largest_shape[1] > tensor->shape[1] ? largest_shape[1] : tensor->shape[1];
+        largest_shape[2] = largest_shape[2] > tensor->shape[2] ? largest_shape[2] : tensor->shape[2];
+        largest_shape[3] = largest_shape[3] > tensor->shape[3] ? largest_shape[3] : tensor->shape[3];
+
+        if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
+            fprintf(file_ptr, "let buff_%d: [Float] = [%f", tensor->index, *((float*)tensor->data));
             for (int j = 1; j < ccml_size(tensor); j++) {
                 fprintf(file_ptr, ", %f", *((float*)tensor->data + j));
             }
-            fprintf(file_ptr, "};\n");
-            fprintf(file_ptr, "\t\t[encoder setBuffer:[device newBufferWithBytes:buff_%d length:%d * sizeof(%s) options:0] offset:0 atIndex:%d];\n\n",
-                            tensor->index, ccml_size(tensor), ccml_type_metal(tensor->type), buffer_counter++);
-
-        }
-        if (tensor->buff == CCML_BUFF_PERM) {
-            fprintf(file_ptr, "\t\tid<MTLBuffer> data_%d = [device newBufferWithLength:%d * sizeof(%s) options:0];\n"
-                            "\t\t[encoder setBuffer:data_%d offset:0 atIndex:%d];\n",
-                            tensor->index, ccml_size(tensor), ccml_type_metal(tensor->type), tensor->index, buffer_counter++);
+            fprintf(file_ptr, "]\n");
+            fprintf(file_ptr, "let data_%d = createBuffer(device: device, array: buff_%d)\n", tensor->index, tensor->index);
+            fprintf(file_ptr, "computeEncoder.setBuffer(data_%d, offset: 0, index: %d)\n", tensor->index, parameter_counter++);
         }
     }
 
-    fprintf(file_ptr, "\n\t\tMTLSize numThreadgroups = {%d, %d, %d};\n"
-                    "\t\tMTLSize numgroups = {1,1,1};\n"
-                    "\t\t[encoder dispatchThreadgroups:numThreadgroups threadsPerThreadgroup:numgroups];\n"
-                    "\t\t[encoder endEncoding];\n"
-                    "\t\t[commandBuffer commit];\n"
-                    "\t\t[commandBuffer waitUntilCompleted];\n\n",
-                    graph->nodes[0]->shape[0] * graph->nodes[0]->shape[1],
-                    graph->nodes[0]->shape[2], graph->nodes[0]->shape[3]);
+    // setting up thread grid and waiting for command buffer to finish
+    fprintf(file_ptr, "\nlet gridSize = MTLSize(width: %d, height: %d, depth: %d)\n"
+                      "let threadGroupSize = MTLSize(width: 1, height: 1, depth: 1)\n"
+                      "computeEncoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)\n"
+                      "computeEncoder.endEncoding()\n"
+                      "commandBuffer.commit()\n"
+                      "commandBuffer.waitUntilCompleted()\n\n",
+                      largest_shape[0] * largest_shape[1],
+                      largest_shape[2], largest_shape[3]);
 
+    // reading data back from buffers
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
-        if (tensor->buff == CCML_BUFF_PERM) {
-            fprintf(file_ptr, "\t\t%s* buff_%d = [data_%d contents];\n\n", ccml_type_metal(tensor->type), tensor->index, tensor->index);
-            fprintf(file_ptr, "\t\tfor (int i = 0; i < %d; i++) {\n"
-                            "\t\t\tprintf(\"%%f \", buff_%d[i]);\n\t\t}\n",
-                            ccml_size(tensor), tensor->index);
+        if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
+            fprintf(file_ptr, "let result_%d_ = data_%d.contents().bindMemory(to: Float.self, capacity: buff_%d.count)\n"
+                              "let result_%d = Array(UnsafeBufferPointer(start: result_%d_, count: buff_%d.count))\n"
+                              "print(\"Result: \\(result_%d)\")\n\n", tensor->index, tensor->index, tensor->index, tensor->index,
+                              tensor->index, tensor->index, tensor->index);
         }
     }
 
-    fprintf(file_ptr, "\n\t}\n\treturn 0;\n}");
-
-    fclose(file_ptr);
-    fclose(file_kernel_ptr);
+    #if defined(__APPLE__)
+        system("xcrun -sdk macosx metal -c kernel.metal -o kernel.air");
+        system("xcrun -sdk macosx metallib kernel.air -o kernel.metallib");
+        system("swiftc -o metal metal.swift -framework MetalKit && ./metal");
+    #else
+        #warning "platform not supported"
+    #endif
 }
+
 
 //
 //  ███████╗██╗  ██╗███████╗ ██████╗██╗   ██╗████████╗██╗ ██████╗ ███╗   ██╗
@@ -1016,32 +1024,10 @@ static void ccml_code_metal(ccml_graph * graph) {
 //
 
 static void ccml_graph_execute(ccml_graph * graph, ccml_backend backend) {
-    // currently only macos and linux are supported
-    #if !defined(__APPLE__)
-        #error "platform not supported"
-    #endif
-
     switch(backend) {
         case CCML_BACKEND_METAL: ccml_code_metal(graph); break;
         default: assert(false && "unknown backend");
     }
-
-    // reading tensors back from their respective files
-    /*
-    for (int i = 0; i < graph->n_nodes; i++) {
-        ccml_tensor * tensor = graph->nodes[i];
-        if (tensor->buff == CCML_BUFF_PERM) {
-            char file_name[CCML_CHAR_MAX];
-            snprintf(file_name, CCML_CHAR_MAX, "tensor_%d", tensor->index);
-            FILE * file_ptr = fopen(file_name, "rb");
-            assert(file_ptr != NULL && "couldn't open file with tensor data");
-            fread(tensor->data, ccml_size(tensor), ccml_type_sizes[tensor->type], file_ptr);
-            char command[CCML_CHAR_MAX] = "rm ";
-            strncat(command, file_name, CCML_CHAR_MAX);
-            system(command);
-        }
-    }
-    */
 }
 
 #endif
