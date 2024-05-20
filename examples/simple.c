@@ -1,4 +1,4 @@
-#include "ccml.h"
+#include "../ccml.h"
 
 int main() {
     // define 2d tensor x with fp32 data type, with gradient tracking

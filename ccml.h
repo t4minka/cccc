@@ -906,15 +906,21 @@ CCML_API const char * ccml_kernel_metal(struct ccml_graph * graph, int n_kernel,
     char * string = kernel;
     *string = '\0';
 
+    printf("start and finish are %d and %d in kernel %d when %d n_nodes\n", start, finish, n_kernel, graph->n_nodes);
+    CCML_ASSERT(start < finish);
+
     // atomic floating point addition function bc metal doesn't support it natively
-    string += snprintf(string, size - (kernel - string),
-                       "#include <metal_stdlib>\n#include <metal_atomic>\n"
-                       "using namespace metal;\n\nkernel void my_kernel_%d(", n_kernel);
+    if (n_kernel == 0) {
+        string += snprintf(string, size - (kernel - string),
+                           "#include <metal_stdlib>\nusing namespace metal;\n");
+    }
+
+    string += snprintf(string, size - (kernel - string), "kernel void my_kernel_%d(", n_kernel);
 
     // adding kernel input parameters to the kernel string
 
     int n_kernel_parameters = 0;
-    for (int i = start; i < finish; i++) {
+    for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
 
         if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
@@ -931,23 +937,20 @@ CCML_API const char * ccml_kernel_metal(struct ccml_graph * graph, int n_kernel,
         }
     }
 
-   int largest_shape[CCML_DIMS_MAX] = {1, 1, 1, 1};
+   int grid[CCML_DIMS_MAX] = {1, 1, 1, 1};
    for (int i = start; i < finish; i++) {
        ccml_tensor * tensor = graph->nodes[i];
-
        int v = tensor->view;
 
-       largest_shape[0] = largest_shape[0] > tensor->shape[v][0] ? largest_shape[0] : tensor->shape[v][0];
-       largest_shape[1] = largest_shape[1] > tensor->shape[v][1] ? largest_shape[1] : tensor->shape[v][1];
-       largest_shape[2] = largest_shape[2] > tensor->shape[v][2] ? largest_shape[2] : tensor->shape[v][2];
-       largest_shape[3] = largest_shape[3] > tensor->shape[v][3] ? largest_shape[3] : tensor->shape[v][3];
-  }
+       grid[0] = grid[0] > tensor->shape[v][0] ? grid[0] : tensor->shape[v][0];
+       grid[1] = grid[1] > tensor->shape[v][1] ? grid[1] : tensor->shape[v][1];
+   }
 
     string += snprintf(string, size - (kernel - string),
                        ", uint3 gid [[thread_position_in_grid]]) {\n"
                        "\tuint id0 = gid.x / %d;\n\tuint id1 = gid.x %% %d;\n"
                        "\tuint id2 = gid.y;\n\tuint id3 = gid.z;\n\n",
-                       largest_shape[1], largest_shape[1]);
+                       grid[1], grid[1]);
 
     for (int i = start; i < finish; i++) {
         ccml_tensor * tensor = graph->nodes[i];
@@ -1008,24 +1011,22 @@ CCML_API const char * ccml_kernel_metal(struct ccml_graph * graph, int n_kernel,
     return kernel;
 }
 
-CCML_API void ccml_kernel_separation(ccml_graph * graph, int * n_kernels, int kernel_separation[CCML_KERN_MAX][2]) {
+void ccml_kernel_separation(ccml_graph *graph, int *n_kernels, int kernel_separation[CCML_KERN_MAX][2]) {
     kernel_separation[*n_kernels][0] = 0;
-    bool has_sum = false;
 
     // Iterate over each node in the graph
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
-        if (tensor->oper == CCML_OPER_SUM && has_sum == true) {
-            kernel_separation[*n_kernels][1] = i;
+
+        if (tensor->oper == CCML_OPER_SUM) {
+            kernel_separation[*n_kernels][1] = i + 1;
             (*n_kernels)++;
             kernel_separation[*n_kernels][0] = i + 1;
-        } else if (tensor->oper == CCML_OPER_SUM) {
-            has_sum = true;
         }
     }
 
     kernel_separation[*n_kernels][1] = graph->n_nodes;
-    (*n_kernels)++;
+    if (*n_kernels == 0) *n_kernels += 1;
 }
 
 CCML_API void ccml_code_metal(ccml_graph * graph) {
@@ -1044,8 +1045,9 @@ CCML_API void ccml_code_metal(ccml_graph * graph) {
     // general metal setup
     fprintf(file_ptr, "import MetalKit\n\n"
                       "let device = MTLCreateSystemDefaultDevice()!\n"
-                      "let libraryURL = Bundle.main.url(forResource: \"kernel\", withExtension: \"metallib\")!\n"
-                      "let defaultLibrary = try! device.makeLibrary(URL: libraryURL)\n"
+                      "let filePath = Bundle.main.path(forResource: \"kernel\", ofType: \"metal\")!\n"
+                      "let source = try! String(contentsOfFile: filePath, encoding: .utf8)\n"
+                      "let library = try! device.makeLibrary(source: source, options: nil)\n"
                       "let commandQueue = device.makeCommandQueue()!\n\n");
 
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -1066,7 +1068,7 @@ CCML_API void ccml_code_metal(ccml_graph * graph) {
         fprintf(file_kernel_ptr, "%s\n\n", ccml_kernel_metal(graph, i, kernel_separation[i][0], kernel_separation[i][1]));
 
         fprintf(file_ptr, "\n// setting up my_kernel_%d\n"
-                          "let kernelFunction_%d = defaultLibrary.makeFunction(name: \"my_kernel_%d\")!\n"
+                          "let kernelFunction_%d = library.makeFunction(name: \"my_kernel_%d\")!\n"
                           "let computePipeline_%d = try! device.makeComputePipelineState(function: kernelFunction_%d)\n"
                           "let commandBuffer_%d = commandQueue.makeCommandBuffer()!\n"
                           "let computeEncoder_%d = commandBuffer_%d.makeComputeCommandEncoder()!\n"
@@ -1112,8 +1114,6 @@ CCML_API void ccml_code_metal(ccml_graph * graph) {
     }
 
     #if defined(__APPLE__)
-        system("xcrun -sdk macosx metal -c kernel.metal -o kernel.air");
-        system("xcrun -sdk macosx metallib kernel.air -o kernel.metallib");
         system("swiftc -o metal metal.swift -framework MetalKit && ./metal");
     #else
         #warning "platform not supported"
