@@ -6,13 +6,12 @@
 #define CCML_VIEW_MAX 4
 #define CCML_DIMS_MAX 4
 
+#define CCML_KERN_MAX 16
 #define CCML_CHAR_MAX 100
 #define CCML_NODE_MAX 128
 
 #define __STDC_WANT_IEC_60559_TYPES_EXT__
 #include <float.h>
-
-#include <assert.h>
 #include <math.h>
 #include <stdbool.h>
 
@@ -26,6 +25,12 @@
 #elif !defined(CCML_API)
     #define CCML_API static
 #endif
+
+#define CCML_ASSERT(x, ...) do { if (!(x)) {                           \
+    fprintf(stderr, "CCML_ASSERT: %s:%d: %s", __FILE__, __LINE__, #x); \
+    __VA_OPT__(fprintf(stderr, ", %s", __VA_ARGS__);)                  \
+    exit(EXIT_FAILURE);                                                \
+} } while(0)
 
 // known issues:
 // - including ccml.h in separate compilation units compiles separate/independent symbols
@@ -326,7 +331,7 @@ CCML_API ccml_tensor * ccml_sqrt(ccml_tensor * tensor) {
 }
 
 CCML_API ccml_tensor * ccml_add(ccml_tensor * lhs, ccml_tensor * rhs) {
-    assert(ccml_can_broadcast(lhs, rhs) && "incompatible dimensions for broadcasting");
+    CCML_ASSERT(ccml_can_broadcast(lhs, rhs), "incompatible dimensions for broadcasting");
 
     bool null_input = lhs == NULL || rhs == NULL;
 
@@ -347,7 +352,7 @@ CCML_API ccml_tensor * ccml_add(ccml_tensor * lhs, ccml_tensor * rhs) {
 }
 
 CCML_API ccml_tensor * ccml_mul(ccml_tensor * lhs, ccml_tensor * rhs) {
-    assert(ccml_can_broadcast(lhs, rhs) && "incompatible dimensions for broadcasting");
+    CCML_ASSERT(ccml_can_broadcast(lhs, rhs), "incompatible dimensions for broadcasting");
 
     bool null_input = lhs == NULL || rhs == NULL;
 
@@ -370,8 +375,8 @@ CCML_API ccml_tensor * ccml_mul(ccml_tensor * lhs, ccml_tensor * rhs) {
 CCML_API void ccml_reshape(ccml_tensor * tensor, int * shape) {
     int size = ccml_size(tensor);
     int new_size = shape[0] * shape[1] * shape[2] * shape[3];
-    assert(size == new_size && "reshaped and source tensor must have the same size");
-    assert(tensor->view < CCML_VIEW_MAX - 1 && "maximum number of views reached");
+    CCML_ASSERT(size == new_size, "reshaped and source tensor must have the same size");
+    CCML_ASSERT(tensor->view < CCML_VIEW_MAX - 1, "maximum number of views reached");
 
     for (int i = 0; i < CCML_DIMS_MAX; i++) {
         tensor->shape[tensor->view + 1][i] = shape[i];
@@ -382,7 +387,7 @@ CCML_API void ccml_reshape(ccml_tensor * tensor, int * shape) {
 }
 
 CCML_API void ccml_permute(ccml_tensor * tensor, int * perm) {
-    assert(tensor->view < CCML_VIEW_MAX - 1 && "maximum number of views reached");
+    CCML_ASSERT(tensor->view < CCML_VIEW_MAX - 1, "maximum number of views reached");
     for (int i = 0; i < CCML_DIMS_MAX; i++) {
         tensor->shape[tensor->view + 1][i] = tensor->shape[tensor->view][perm[i]];
         tensor->stride[tensor->view + 1][i] = tensor->stride[tensor->view][perm[i]];
@@ -392,7 +397,7 @@ CCML_API void ccml_permute(ccml_tensor * tensor, int * perm) {
 }
 
 CCML_API ccml_tensor * ccml_sum(ccml_tensor * tensor, int n_axes, int axes[CCML_DIMS_MAX]) {
-    assert(n_axes > 0 && n_axes < CCML_DIMS_MAX && "invalid number of summed axes");
+    CCML_ASSERT(n_axes > 0 && n_axes < CCML_DIMS_MAX, "invalid number of summed axes");
 
     int shape[CCML_DIMS_MAX] = {1, 1, 1, 1};
     for (int i = 0; i < CCML_DIMS_MAX; i++) {
@@ -468,10 +473,11 @@ CCML_API ccml_tensor * ccml_tanh(ccml_tensor * tensor) {
 }
 
 CCML_API ccml_tensor * ccml_matmul(ccml_tensor * lhs, ccml_tensor * rhs) {
-    assert(ccml_is_matrix(lhs) && "tensor must be a matrix for matmul");
-    assert(ccml_is_matrix(rhs) && "tensor must be a matrix for matmul");
+    CCML_ASSERT(ccml_is_matrix(lhs), "tensor must be a matrix for matmul");
+    CCML_ASSERT(ccml_is_matrix(rhs), "tensor must be a matrix for matmul");
 
-    assert(lhs->shape[lhs->view][1] == rhs->shape[rhs->view][0]);
+    CCML_ASSERT(lhs->shape[lhs->view][1] == rhs->shape[rhs->view][0],
+                "tensors have incompatible dimensions for a matmul");
 
     ccml_reshape(lhs, (int[]){lhs->shape[lhs->view][0], lhs->shape[lhs->view][1], 1, 1});
     ccml_reshape(rhs, (int[]){1, rhs->shape[rhs->view][0], rhs->shape[rhs->view][1], 1});
@@ -554,7 +560,7 @@ CCML_API int ccml_hashmap_get(ccml_hashmap * map, void * key) {
 
 CCML_API void ccml_hashmap_set(ccml_hashmap * map, void * key, int value) {
     if (map->used >= map->capacity) {
-        assert(false && "hashmap size overflow");
+        CCML_ASSERT(false, "hashmap size overflow");
     }
 
     uint64_t hash = ccml_hash_key(key);
@@ -609,7 +615,7 @@ ccml_graph_forward(struct ccml_graph * graph, ccml_tensor * tensor, int * node_c
     }
 
     if (ccml_hashmap_get(graph->map, tensor) == -1) {
-        assert(*node_counter < CCML_NODE_MAX - 1 && "more nodes created than CCML_NODE_MAX");
+        CCML_ASSERT(*node_counter < CCML_NODE_MAX - 1, "more nodes created than CCML_NODE_MAX");
         tensor->index = *node_counter;
         graph->nodes[*node_counter] = tensor;
         ccml_hashmap_set(graph->map, tensor, (*node_counter)++);
@@ -668,7 +674,7 @@ CCML_API void ccml_graph_backward(ccml_graph * graph, ccml_tensor * root) {
                 case CCML_OPER_SUM:
                     partial_0 = one; break;
                 default:
-                    assert(false && "unknown variant of ccml_oper");
+                    CCML_ASSERT(false, "unknown variant of ccml_oper");
             }
 
             // multiplying tensor->grad by partials and adding them to
@@ -720,7 +726,7 @@ CCML_API void ccml_graph_cse(ccml_graph * graph) {
     // an expression takes the following format
     // (oper-int) * 10^8 + (src0-index) * 10^4 + (src1-index)
 
-    assert(CCML_NODE_MAX < 9999 && "ccml_graph_cse must be adjusted w/ the increased node count");
+    CCML_ASSERT(CCML_NODE_MAX < 9999, "ccml_graph_cse must be adjusted w/ the increased node count");
 
     // erasing graph->map hashmap
     for (int i = 0; i < graph->map->capacity; i++) {
@@ -847,7 +853,7 @@ CCML_API const char * ccml_new_index(ccml_tensor * tensor, ccml_index index) {
             }
             operand = tensor;
             break;
-        default: assert(false && "unknown variant of ccml_index");
+        default: CCML_ASSERT(false, "unknown variant of ccml_index");
     }
 
     strncat(result + strlen(result), "]", size - strlen(result));
@@ -883,18 +889,18 @@ CCML_API const char * ccml_oper_metal(ccml_oper oper) {
         case CCML_OPER_SQRT: return "sqrt";
         case CCML_OPER_ADD: return "+";
         case CCML_OPER_MUL: return "*";
-        default: assert(false && "no meaningful conversion to string exists");
+        default: CCML_ASSERT(false, "no meaningful conversion to string exists");
     }
 }
 
 CCML_API const char * ccml_type_metal(ccml_type type) {
     switch (type) {
         case CCML_TYPE_FP32: return "float ";
-        default: assert(false && "unknown variant of ccml_type");
+        default: CCML_ASSERT(false, "unknown variant of ccml_type");
     }
 }
 
-CCML_API const char * ccml_kernel_metal(struct ccml_graph * graph) {
+CCML_API const char * ccml_kernel_metal(struct ccml_graph * graph, int n_kernel, int start, int finish) {
     int size = CCML_NODE_MAX * CCML_CHAR_MAX;
     char * kernel = malloc(size * sizeof(char));
     char * string = kernel;
@@ -903,23 +909,22 @@ CCML_API const char * ccml_kernel_metal(struct ccml_graph * graph) {
     // atomic floating point addition function bc metal doesn't support it natively
     string += snprintf(string, size - (kernel - string),
                        "#include <metal_stdlib>\n#include <metal_atomic>\n"
-                       "using namespace metal;\n\nkernel void my_kernel(");
+                       "using namespace metal;\n\nkernel void my_kernel_%d(", n_kernel);
 
     // adding kernel input parameters to the kernel string
 
     int n_kernel_parameters = 0;
-    for (int i = 0; i < graph->n_nodes; i++) {
+    for (int i = start; i < finish; i++) {
         ccml_tensor * tensor = graph->nodes[i];
 
         if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
             if (tensor->oper == CCML_OPER_SUM) {}
             if (n_kernel_parameters == 0) {
-                string += snprintf(string, size - (kernel - string), "device %s%s* data_%d [[buffer(0)]]",
-                                   tensor->oper == CCML_OPER_SUM ? "atomic_" : "", ccml_type_metal(tensor->type), i);
+                string += snprintf(string, size - (kernel - string), "device %s* data_%d [[buffer(0)]]",
+                                   ccml_type_metal(tensor->type), i);
                 n_kernel_parameters++;
             } else {
-                string += snprintf(string, size - (kernel - string), ", device %s%s* data_%d [[buffer(%d)]]",
-                                   tensor->oper == CCML_OPER_SUM ? "atomic_" : "",
+                string += snprintf(string, size - (kernel - string), ", device %s* data_%d [[buffer(%d)]]",
                                    ccml_type_metal(tensor->type), i, n_kernel_parameters);
                 n_kernel_parameters++;
             }
@@ -927,7 +932,7 @@ CCML_API const char * ccml_kernel_metal(struct ccml_graph * graph) {
     }
 
    int largest_shape[CCML_DIMS_MAX] = {1, 1, 1, 1};
-   for (int i = 0; i < graph->n_nodes; i++) {
+   for (int i = start; i < finish; i++) {
        ccml_tensor * tensor = graph->nodes[i];
 
        int v = tensor->view;
@@ -944,7 +949,7 @@ CCML_API const char * ccml_kernel_metal(struct ccml_graph * graph) {
                        "\tuint id2 = gid.y;\n\tuint id3 = gid.z;\n\n",
                        largest_shape[1], largest_shape[1]);
 
-    for (int i = 0; i < graph->n_nodes; i++) {
+    for (int i = start; i < finish; i++) {
         ccml_tensor * tensor = graph->nodes[i];
 
         switch (tensor->oper) {
@@ -988,13 +993,14 @@ CCML_API const char * ccml_kernel_metal(struct ccml_graph * graph) {
                 break;
             case CCML_OPER_SUM:
                 string += snprintf(string, size - (kernel - string),
-                                   "\tatomic_fetch_add_explicit(&data_%d%s, ",
+                                   "\tfor (int i = 0; i < %d; i++) {\n\t\tdata_%d%s += ",
+                                   ccml_size(tensor->src[0])/ccml_size(tensor),
                                    tensor->index, ccml_new_index(tensor, CCML_INDEX_REDUCE));
-                string += snprintf(string, size - (kernel - string), "data_%d%s, memory_order_relaxed);\n",
+                string += snprintf(string, size - (kernel - string), "data_%d%s;\n\t}\n",
                                    tensor->src[0]->index,
                                    ccml_new_index(tensor->src[0], CCML_INDEX_NORMAL));
                 break;
-            default: assert(false && "unknown variant of ccml_oper");
+            default: CCML_ASSERT(false, "unknown variant of ccml_oper");
         }
     }
 
@@ -1002,73 +1008,106 @@ CCML_API const char * ccml_kernel_metal(struct ccml_graph * graph) {
     return kernel;
 }
 
-CCML_API void ccml_code_metal(ccml_graph * graph) {
-    FILE * file_ptr = fopen("metal.swift", "w");
-    assert(file_ptr != NULL && "failed to create file for metal source");
+CCML_API void ccml_kernel_separation(ccml_graph * graph, int * n_kernels, int kernel_separation[CCML_KERN_MAX][2]) {
+    kernel_separation[*n_kernels][0] = 0;
+    bool has_sum = false;
 
-    FILE * file_kernel_ptr = fopen("kernel.metal", "w");
-    assert(file_kernel_ptr != NULL && "failed to create a file for kernel source");
-
-    fprintf(file_kernel_ptr, "%s", ccml_kernel_metal(graph));
-
-    // metal imports
-    fprintf(file_ptr, "import MetalKit\n"
-                       "func createBuffer(device: MTLDevice, array: [Float]) -> MTLBuffer {\n"
-                       "\treturn device.makeBuffer(bytes: array, length: array.count * MemoryLayout<Float>.size, options: [])!\n"
-                       "}\n\n");
-
-    // metal setup and pipeline
-    fprintf(file_ptr, "let device = MTLCreateSystemDefaultDevice()!\n"
-                       "let commandQueue = device.makeCommandQueue()!\n"
-                       "let library = try! device.makeLibrary(filepath: \"kernel.metallib\")\n"
-                       "let function = library.makeFunction(name: \"my_kernel\")!\n"
-                       "let computePipelineState = try! device.makeComputePipelineState(function: function)\n"
-                       "let commandBuffer = commandQueue.makeCommandBuffer()!\n"
-                       "let computeEncoder = commandBuffer.makeComputeCommandEncoder()!\n"
-                       "computeEncoder.setComputePipelineState(computePipelineState)\n\n");
-
-    // buffers setup
-    int parameter_counter = 0;
-    int largest_shape[CCML_DIMS_MAX] = {1, 1, 1, 1};
+    // Iterate over each node in the graph
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
-
-        int v = tensor->view;
-
-        largest_shape[0] = largest_shape[0] > tensor->shape[v][0] ? largest_shape[0] : tensor->shape[v][0];
-        largest_shape[1] = largest_shape[1] > tensor->shape[v][1] ? largest_shape[1] : tensor->shape[v][1];
-        largest_shape[2] = largest_shape[2] > tensor->shape[v][2] ? largest_shape[2] : tensor->shape[v][2];
-        largest_shape[3] = largest_shape[3] > tensor->shape[v][3] ? largest_shape[3] : tensor->shape[v][3];
-
-        if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
-            fprintf(file_ptr, "let buff_%d: [Float] = [%f", tensor->index, *((float*)tensor->data));
-            for (int j = 1; j < ccml_size(tensor); j++) {
-                fprintf(file_ptr, ", %f", *((float*)tensor->data + j));
-            }
-            fprintf(file_ptr, "]\n");
-            fprintf(file_ptr, "let data_%d = createBuffer(device: device, array: buff_%d)\n", tensor->index, tensor->index);
-            fprintf(file_ptr, "computeEncoder.setBuffer(data_%d, offset: 0, index: %d)\n", tensor->index, parameter_counter++);
+        if (tensor->oper == CCML_OPER_SUM && has_sum == true) {
+            kernel_separation[*n_kernels][1] = i;
+            (*n_kernels)++;
+            kernel_separation[*n_kernels][0] = i + 1;
+        } else if (tensor->oper == CCML_OPER_SUM) {
+            has_sum = true;
         }
     }
 
-    // setting up thread grid and waiting for command buffer to finish
-    fprintf(file_ptr, "\nlet gridSize = MTLSize(width: %d, height: %d, depth: %d)\n"
-                      "let threadGroupSize = MTLSize(width: 1, height: 1, depth: 1)\n"
-                      "computeEncoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)\n"
-                      "computeEncoder.endEncoding()\n"
-                      "commandBuffer.commit()\n"
-                      "commandBuffer.waitUntilCompleted()\n\n",
-                      largest_shape[0] * largest_shape[1],
-                      largest_shape[2], largest_shape[3]);
+    kernel_separation[*n_kernels][1] = graph->n_nodes;
+    (*n_kernels)++;
+}
 
-    // reading data back from buffers
+CCML_API void ccml_code_metal(ccml_graph * graph) {
+    FILE * file_ptr = fopen("metal.swift", "w");
+    CCML_ASSERT(file_ptr != NULL, "failed to create file for metal source");
+
+    FILE * file_kernel_ptr = fopen("kernel.metal", "w");
+    CCML_ASSERT(file_kernel_ptr != NULL, "failed to create a file for kernel source");
+
+    // division based on buffer indices, indicating the starting and finish index
+    // of i-th kernel at kernel_separation[i][0] and kernel_separation[i][1] respectively
+    int kernel_separation[CCML_KERN_MAX][2] = {0};
+    int n_kernels = 0;
+    ccml_kernel_separation(graph, &n_kernels, kernel_separation);
+
+    // general metal setup
+    fprintf(file_ptr, "import MetalKit\n\n"
+                      "let device = MTLCreateSystemDefaultDevice()!\n"
+                      "let libraryURL = Bundle.main.url(forResource: \"kernel\", withExtension: \"metallib\")!\n"
+                      "let defaultLibrary = try! device.makeLibrary(URL: libraryURL)\n"
+                      "let commandQueue = device.makeCommandQueue()!\n\n");
+
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
         if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
-            fprintf(file_ptr, "let result_%d_ = data_%d.contents().bindMemory(to: Float.self, capacity: buff_%d.count)\n"
-                              "let result_%d = Array(UnsafeBufferPointer(start: result_%d_, count: buff_%d.count))\n"
-                              "print(\"Result: \\(result_%d)\")\n\n", tensor->index, tensor->index, tensor->index, tensor->index,
-                              tensor->index, tensor->index, tensor->index);
+            fprintf(file_ptr, "let cpu_buffer_%d: [Float] = [%f", i, *((float*)tensor->data));
+            for (int j = 0; j < ccml_size(tensor); j++) {
+                fprintf(file_ptr, ", %f", *((float*)tensor->data + j));
+            }
+            fprintf(file_ptr, "]\n");
+            fprintf(file_ptr, "let gpu_buffer_%d = device.makeBuffer(bytes: cpu_buffer_%d, length: %d * MemoryLayout<Float>.size, options: [])\n",
+                              i, i, ccml_size(tensor));
+        }
+    }
+
+    // code specific to each i-th kernel
+    for (int i = 0; i < n_kernels; i++) {
+        fprintf(file_kernel_ptr, "%s\n\n", ccml_kernel_metal(graph, i, kernel_separation[i][0], kernel_separation[i][1]));
+
+        fprintf(file_ptr, "\n// setting up my_kernel_%d\n"
+                          "let kernelFunction_%d = defaultLibrary.makeFunction(name: \"my_kernel_%d\")!\n"
+                          "let computePipeline_%d = try! device.makeComputePipelineState(function: kernelFunction_%d)\n"
+                          "let commandBuffer_%d = commandQueue.makeCommandBuffer()!\n"
+                          "let computeEncoder_%d = commandBuffer_%d.makeComputeCommandEncoder()!\n"
+                          "computeEncoder_%d.setComputePipelineState(computePipeline_%d)\n\n",
+                          i, i, i, i, i, i, i, i, i,i );
+
+        // code specific to i-th kernel's buffers
+        int grid[CCML_DIMS_MAX] = {1, 1, 1, 1};
+        int n_buffers = 0;
+        for (int j = kernel_separation[i][0]; j < kernel_separation[i][1]; j++) {
+            ccml_tensor * tensor = graph->nodes[j];
+            if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
+                int v = tensor->view;
+
+                grid[0] = grid[0] > tensor->shape[v][0] ? grid[0] : tensor->shape[v][0];
+                grid[1] = grid[1] > tensor->shape[v][1] ? grid[1] : tensor->shape[v][1];
+                grid[2] = grid[2] > tensor->shape[v][2] ? grid[2] : tensor->shape[v][2];
+                grid[3] = grid[3] > tensor->shape[v][3] ? grid[3] : tensor->shape[v][3];
+
+                fprintf(file_ptr, "computeEncoder_%d.setBuffer(gpu_buffer_%d, offset: 0, index: %d)\n",
+                                   i, j, n_buffers++);
+            }
+        }
+
+        fprintf(file_ptr, "\nlet gridSize_%d = MTLSize(width: %d, height: %d, depth: %d)\n"
+                          "let threadGroupSize_%d = MTLSize(width: 1, height: 1, depth: 1)\n"
+                          "computeEncoder_%d.dispatchThreads(gridSize_%d, threadsPerThreadgroup: threadGroupSize_%d)\n"
+                          "computeEncoder_%d.endEncoding()\n"
+                          "commandBuffer_%d.commit()\n"
+                          "commandBuffer_%d.waitUntilCompleted()\n\n",
+                          i, grid[0] * grid[1], grid[2], grid[3], i, i, i, i, i, i, i);
+    }
+
+    // copying data back from GPU to buffers
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ccml_tensor * tensor = graph->nodes[i];
+        if (ccml_has_buffer(tensor) && ccml_size(tensor) != 1) {
+            fprintf(file_ptr, "let pointer_%d = gpu_buffer_%d!.contents().assumingMemoryBound(to: Float.self)\n"
+                              "let result_%d = Array(UnsafeBufferPointer(start: pointer_%d, count: cpu_buffer_%d.count))\n"
+                              "print(result_%d)\n\n",
+                              i, i, i, i, i, i);
         }
     }
 
@@ -1080,6 +1119,7 @@ CCML_API void ccml_code_metal(ccml_graph * graph) {
         #warning "platform not supported"
     #endif
 }
+
 
 
 //
@@ -1094,8 +1134,8 @@ CCML_API void ccml_code_metal(ccml_graph * graph) {
 CCML_API void ccml_graph_execute(ccml_graph * graph, ccml_backend backend) {
     switch(backend) {
         case CCML_BACKEND_METAL: ccml_code_metal(graph); break;
-        default: assert(false && "unknown backend");
+        default: CCML_ASSERT(false, "unknown backend");
     }
 }
 
-#endif
+#endif /* CCML_IMPL */
