@@ -10,8 +10,8 @@ int main() {
     ccml_tensor * z = ccml_matmul(x, y);
     // create computational graph
     ccml_graph * graph = ccml_new_graph(z);
-    // generate the kernel and openCL setup code
-    ccml_graph_execute(graph, CCML_BACKEND_METAL);
+    // generate the kernel and metal setup code and run it
+    ccml_graph_execute(graph);
     // free the memory :)
     ccml_graph_free(graph);
 }
