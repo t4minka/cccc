@@ -1,17 +1,19 @@
 #include "../ccml.h"
 
 int main() {
-    // define 2d tensor x with fp32 data type, with gradient tracking
-    ccml_tensor * x = ccml_new_tensor_2d(CCML_TYPE_FP32, 2, 3, false);
-    ccml_fill(x, 2.0f);
-    ccml_tensor * y = ccml_new_tensor_2d(CCML_TYPE_FP32, 3, 4, false);
-    ccml_fill(y, 3.0f);
-    // perform arithmetical operations
-    ccml_tensor * z = ccml_matmul(x, y);
-    // create computational graph
-    ccml_graph * graph = ccml_new_graph(z);
-    // generate the kernel and metal setup code and run it
+    // creating new memory context
+    ccml_context * ctx = ccml_new_context();
+
+    // creating a 2d 2x2 tensor with fp32 type with gradient tracking
+    // and filling it with twos
+    ccml_tensor * x = ccml_new_tensor_2d(ctx, CCML_TYPE_FP32, 2, 2, true);
+    ccml_tensor * z = ccml_soft_max(ctx, x);
+    ccml_fill(ctx, x, 2.0f);
+
+    // creating a new computational graph
+    ccml_graph * graph = ccml_new_graph(ctx, z);
     ccml_graph_execute(graph);
-    // free the memory :)
-    ccml_graph_free(graph);
+    
+    // freeing the context
+    ccml_context_free(ctx);
 }
