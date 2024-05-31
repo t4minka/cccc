@@ -2,7 +2,7 @@
 
 int main() {
     // creating new memory context
-    ccml_context * ctx = ccml_new_context();
+    ccml_context * ctx = ccml_new_context(malloc(2<<16), 2<<16);
 
     // creating a 2d 2x2 tensor with fp32 type with gradient tracking
     // and filling it with twos
