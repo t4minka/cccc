@@ -2,12 +2,13 @@
 
 int main() {
     // creating new memory context
-    ccml_context * ctx = ccml_new_context(malloc(2<<16), 2<<16);
+    int bytes = 2<<16;
+    ccml_context * ctx = ccml_new_context(malloc(bytes), bytes);
 
     // creating a 2d 2x2 tensor with fp32 type with gradient tracking
     // and filling it with twos
     ccml_tensor * x = ccml_new_tensor_2d(ctx, CCML_TYPE_FP32, 2, 2, true);
-    ccml_tensor * z = ccml_soft_max(ctx, x);
+    ccml_tensor * z = ccml_mul(ctx, ccml_exp(ctx, ccml_sin(ctx, x)), ccml_sin(ctx, x));
     ccml_fill(ctx, x, 2.0f);
 
     // creating a new computational graph
