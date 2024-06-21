@@ -1,1 +1,1 @@
-CCML is a single header, pure C autodiff library (inspired by tinygrad/luminal) with automatic GPU code generation, kernel fusion and powerful graph optimisations, all in a small (~1.2k LOC) and readable codebase, check out the examples folder :)
+CCML is a single header, pure C autodiff library (inspired by tinygrad/luminal) with automatic GPU code generation, kernel fusion and powerful graph optimisations, all in a small (~1k LOC) and readable codebase, check out the examples folder :)
