@@ -109,7 +109,7 @@ typedef enum ccml_oper {
     CCML_OPER_EXP,
     CCML_OPER_SIN,
     CCML_OPER_REC,
-    CCML_OPER_SQRT,
+    CCML_OPER_SQT,
     CCML_OPER_ADD,
     CCML_OPER_MUL,
     CCML_OPER_SUM,
@@ -310,7 +310,7 @@ CCML_API ccml_tensor * ccml_rec(ccml_context * ctx, ccml_tensor * tensor) {
 }
 
 CCML_API ccml_tensor * ccml_sqrt(ccml_context * ctx, ccml_tensor * tensor) {
-    ccml_tensor * result = ccml_new_tensor_impl(ctx, tensor->type, CCML_OPER_SQRT, tensor->shape);
+    ccml_tensor * result = ccml_new_tensor_impl(ctx, tensor->type, CCML_OPER_SQT, tensor->shape);
     result->src[0] = tensor;
     result->tracking = tensor->tracking;
     return result;
@@ -615,7 +615,7 @@ CCML_API void ccml_graph_backward(ccml_context * ctx, ccml_graph * graph, ccml_t
                 case CCML_OPER_REC: {
                     ccml_tensor * square = ccml_square(ctx, tensor->src[0]);
                     grads[0] = ccml_mul(ctx, tensor->grad, ccml_neg(ctx, ccml_rec(ctx, square))); break; }
-                case CCML_OPER_SQRT: {
+                case CCML_OPER_SQT: {
                     ccml_tensor * fraction = ccml_mul(ctx, ccml_scalar(ctx, 2.0f), ccml_sqrt(ctx, tensor->src[0]));
                     grads[0] = ccml_mul(ctx, tensor->grad, ccml_rec(ctx, fraction)); break; }
                 case CCML_OPER_ADD:
@@ -683,17 +683,8 @@ CCML_API void ccml_graph_allocate(ccml_context * ctx, ccml_graph * graph) {
     }
 }
 
-//
-//   ██████╗ ██████╗ ████████╗██╗███╗   ███╗██╗███████╗███████╗
-//  ██╔═══██╗██╔══██╗╚══██╔══╝██║████╗ ████║██║██╔════╝██╔════╝
-//  ██║   ██║██████╔╝   ██║   ██║██╔████╔██║██║███████╗█████╗
-//  ██║   ██║██╔═══╝    ██║   ██║██║╚██╔╝██║██║╚════██║██╔══╝
-//  ╚██████╔╝██║        ██║   ██║██║ ╚═╝ ██║██║███████║███████╗
-//   ╚═════╝ ╚═╝        ╚═╝   ╚═╝╚═╝     ╚═╝╚═╝╚══════╝╚══════╝
-//
-
 CCML_API ccml_graph * ccml_new_graph(ccml_context * ctx, ccml_tensor * root) {
-    ccml_tensor * root_save = ccml_new_tensor_impl(ctx, root->type, CCML_OPER_INTR, root->shape);
+    ccml_tensor * root_save = ccml_new_tensor_impl(ctx, root->type, CCML_OPER_SAVE, root->shape);
     root_save->src[0] = root;
     root_save->tracking = root->tracking;
     struct ccml_graph * graph = ccml_malloc(ctx, sizeof(struct ccml_graph));
@@ -711,15 +702,15 @@ CCML_API ccml_graph * ccml_new_graph(ccml_context * ctx, ccml_tensor * root) {
 };
 
 //
-//  ██╗███╗   ██╗██████╗ ███████╗██╗  ██╗
-//  ██║████╗  ██║██╔══██╗██╔════╝╚██╗██╔╝
-//  ██║██╔██╗ ██║██║  ██║█████╗   ╚███╔╝
-//  ██║██║╚██╗██║██║  ██║██╔══╝   ██╔██╗
-//  ██║██║ ╚████║██████╔╝███████╗██╔╝ ██╗
-//  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚══════╝╚═╝  ╚═╝
+//  ██╗███╗   ██╗██████╗ ███████╗██╗  ██╗██╗███╗   ██╗ ██████╗
+//  ██║████╗  ██║██╔══██╗██╔════╝╚██╗██╔╝██║████╗  ██║██╔════╝
+//  ██║██╔██╗ ██║██║  ██║█████╗   ╚███╔╝ ██║██╔██╗ ██║██║  ███╗
+//  ██║██║╚██╗██║██║  ██║██╔══╝   ██╔██╗ ██║██║╚██╗██║██║   ██║
+//  ██║██║ ╚████║██████╔╝███████╗██╔╝ ██╗██║██║ ╚████║╚██████╔╝
+//  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝ ╚═════╝
 //
 
-CCML_API const char * ccml_new_id(ccml_context * ctx, ccml_tensor * parent, ccml_tensor * child) {
+CCML_API const char * ccml_new_index(ccml_context * ctx, ccml_tensor * parent, ccml_tensor * child) {
     int size = CCML_CHAR_MAX;
     char * index = ccml_malloc(ctx, size * sizeof(char));
     *index = '\0';
@@ -762,15 +753,20 @@ CCML_API void ccml_kernel_slicing(ccml_graph * graph, int * n_kernels,
 //  ╚═╝     ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝
 //
 
+#if defined(__APPLE__)
+
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
 CCML_API const char * ccml_oper_metal(ccml_oper oper) {
     switch (oper) {
-        case CCML_OPER_LOG:  return "log";
-        case CCML_OPER_EXP:  return "exp";
-        case CCML_OPER_SIN:  return "sin";
-        case CCML_OPER_REC:  return "1/";
-        case CCML_OPER_SQRT: return "sqrt";
-        case CCML_OPER_ADD:  return "+";
-        case CCML_OPER_MUL:  return "*";
+        case CCML_OPER_LOG: return "log";
+        case CCML_OPER_EXP: return "exp";
+        case CCML_OPER_SIN: return "sin";
+        case CCML_OPER_REC: return "1/";
+        case CCML_OPER_SQT: return "sqrt";
+        case CCML_OPER_ADD: return "+";
+        case CCML_OPER_MUL: return "*";
         default: CCML_ASSERT(false, "no meaningful conversion to string exists");
     }
 }
@@ -782,24 +778,19 @@ CCML_API const char * ccml_type_metal(ccml_type type) {
     }
 }
 
-CCML_API const char * ccml_type_swift(ccml_type type) {
-    switch (type) {
-        case CCML_TYPE_FP32: return "Float";
-        default: CCML_ASSERT(false, "unknown variant of ccml_type");
-    }
-}
-
-CCML_API void ccml_kernel_metal(ccml_context * ctx, struct ccml_graph * graph,
-                                int n_kernel, int start, int finish) {
-    FILE * file_kernel_ptr = fopen("kernel.metal", "w");
-    CCML_ASSERT(file_kernel_ptr != NULL);
+CCML_API const char * ccml_kernel_metal(ccml_context * ctx, struct ccml_graph * graph,
+                                        int n_kernel, int start, int finish) {
+    int size = CCML_CHAR_MAX * CCML_NODE_MAX * sizeof(char);
+    const char * kernel = ccml_malloc(ctx, size);
+    char * string = kernel;
 
     // the n_kernel parameter specifies the id of the kernel being generated,
     // and start to finish are ides of graph->nodes that pertain to that kernel
     if (n_kernel == 0) {
-        fprintf(file_kernel_ptr, "#include <metal_stdlib>\nusing namespace metal;\n");
+        string += snprintf(string, size - (kernel - string), "#include <metal_stdlib>\nusing namespace metal;\n");
     }
-    fprintf(file_kernel_ptr, "kernel void my_kernel_%d(", n_kernel);
+
+    string += snprintf(string, size - (kernel - string), "kernel void my_kernel_%d(", n_kernel);
     // adding kernel input parameters to the kernel string
     int n_kernel_parameters = 0;
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -807,12 +798,12 @@ CCML_API void ccml_kernel_metal(ccml_context * ctx, struct ccml_graph * graph,
 
         if (ccml_has_buffer(tensor)) {
             if (n_kernel_parameters == 0) {
-                fprintf(file_kernel_ptr, "device %s* data_%d [[buffer(0)]]",
-                        ccml_type_metal(tensor->type), i);
+                string += snprintf(string, size - (kernel - string), "device %s* data_%d [[buffer(0)]]",
+                                   ccml_type_metal(tensor->type), i);
                 n_kernel_parameters++;
             } else {
-                fprintf(file_kernel_ptr, ", device %s* data_%d [[buffer(%d)]]",
-                        ccml_type_metal(tensor->type), i, n_kernel_parameters);
+                string += snprintf(string, size - (kernel - string),  ", device %s* data_%d [[buffer(%d)]]",
+                                   ccml_type_metal(tensor->type), i, n_kernel_parameters);
                 n_kernel_parameters++;
             }
         }
@@ -825,10 +816,12 @@ CCML_API void ccml_kernel_metal(ccml_context * ctx, struct ccml_graph * graph,
         grid[0] = grid[0] > tensor->shape[0] ? grid[0] : tensor->shape[0];
         grid[1] = grid[1] > tensor->shape[1] ? grid[1] : tensor->shape[1];
     }
-    fprintf(file_kernel_ptr, ", uint3 gid [[thread_position_in_grid]]) {\n"
-            "\tuint id0 = gid.x / %d;\n\tuint id1 = gid.x %% %d;\n"
-            "\tuint id2 = gid.y;\n\tuint id3 = gid.z;\n\n",
-            grid[1], grid[1]);
+
+    string += snprintf(string, size - (kernel - string),
+                       ", uint3 gid [[thread_position_in_grid]]) {\n"
+                       "\tuint id0 = gid.x / %d;\n\tuint id1 = gid.x %% %d;\n"
+                       "\tuint id2 = gid.y;\n\tuint id3 = gid.z;\n\n", grid[1], grid[1]);
+
     for (int i = start; i < finish; i++) {
         ccml_tensor * tensor = graph->nodes[i];
         switch (tensor->oper) {
@@ -836,121 +829,111 @@ CCML_API void ccml_kernel_metal(ccml_context * ctx, struct ccml_graph * graph,
             case CCML_OPER_EXP:
             case CCML_OPER_SIN:
             case CCML_OPER_REC:
-            case CCML_OPER_SQRT:
-                fprintf(file_kernel_ptr, "\t%stemp_%d = %s(temp_%d);\n",
-                        ccml_type_metal(tensor->type), tensor->index,
-                        ccml_oper_metal(tensor->oper), tensor->src[0]->index); break;
+            case CCML_OPER_SQT:
+                string += snprintf(string, size - (kernel - string), "\t%stemp_%d = %s(temp_%d);\n",
+                                   ccml_type_metal(tensor->type), tensor->index,
+                                   ccml_oper_metal(tensor->oper), tensor->src[0]->index); break;
             case CCML_OPER_ADD:
             case CCML_OPER_MUL:
-                fprintf(file_kernel_ptr, "\t%stemp_%d = temp_%d %s temp_%d;\n",
-                        ccml_type_metal(tensor->type), tensor->index,
-                        tensor->src[0]->index, ccml_oper_metal(tensor->oper),
-                        tensor->src[1]->index); break;
+                string += snprintf(string, size - (kernel - string), "\t%stemp_%d = temp_%d %s temp_%d;\n",
+                                   ccml_type_metal(tensor->type), tensor->index,
+                                   tensor->src[0]->index, ccml_oper_metal(tensor->oper),
+                                   tensor->src[1]->index); break;
             case CCML_OPER_SUM:
-                fprintf(file_kernel_ptr, "\tfor (int i = 0; i < %d; i++) {\n"
-                        "\t\t}\n", 2);  break;
+                string += snprintf(string, size - (kernel - string), "\tfor (int i = 0; i < %d; i++) {\n"
+                                   "\t\t}\n", 2);  break;
             case CCML_OPER_RES:
             case CCML_OPER_PER:
                 break;
             case CCML_OPER_CNST:
             case CCML_OPER_LOAD:
-                fprintf(file_kernel_ptr, "\t%stemp_%d = data_%d%s;\n",
-                        ccml_type_metal(tensor->type), tensor->index, tensor->index,
-                        ccml_new_id(ctx, NULL, tensor)); break;
+                string += snprintf(string, size - (kernel - string), "\t%stemp_%d = data_%d%s;\n",
+                                   ccml_type_metal(tensor->type), tensor->index, tensor->index,
+                                   ccml_new_index(ctx, NULL, tensor)); break;
             case CCML_OPER_INTR:
             case CCML_OPER_SAVE:
-                fprintf(file_kernel_ptr, "\tdata_%d%s = temp_%d;\n", tensor->index,
-                        ccml_new_id(ctx, tensor, tensor->src[0]), tensor->src[0]->index); break;
+                string += snprintf(string, size - (kernel - string), "\tdata_%d%s = temp_%d;\n", tensor->index,
+                                   ccml_new_index(ctx, tensor, tensor->src[0]), tensor->src[0]->index); break;
             default:
                 CCML_ASSERT(false, "unknown variant of ccml_oper");
         }
     }
 
-    fprintf(file_kernel_ptr, "}");
-    fclose(file_kernel_ptr);
+    snprintf(string, size - (kernel - string), "}");
+    return kernel;
 }
 
-CCML_API void ccml_setup_metal(ccml_graph * graph) {
-    FILE * file_metal_ptr = fopen("metal.swift", "w");
-    CCML_ASSERT(file_metal_ptr != NULL, "failed to open file for metal source");
-    // kernels[i][0] and kernels[i][1] specifies the starting and finishing
-    // ides of graph->nodes that pertain to i-th kernel
-    int kernels[CCML_KERN_MAX][2] = {0};
-    int n_kernels = 0;
-    ccml_kernel_slicing(graph, &n_kernels, kernels);
-    // general metal setup
-    fprintf(file_metal_ptr, "import MetalKit\n\n"
-            "let device = MTLCreateSystemDefaultDevice()!\n"
-            "let filePath = Bundle.main.path(forResource: \"kernel\", ofType: \"metal\")!\n"
-            "let source = try! String(contentsOfFile: filePath, encoding: .utf8)\n"
-            "let library = try! device.makeLibrary(source: source, options: nil)\n"
-            "let commandQueue = device.makeCommandQueue()!\n\n");
-    for (int i = 0; i < graph->n_nodes; i++) {
-        ccml_tensor * tensor = graph->nodes[i];
-        if (ccml_has_buffer(tensor)) {
-            fprintf(file_metal_ptr, "var cpu_buffer_%d: [%s] = [%f", i,
-                    ccml_type_swift(tensor->type), *(float *)tensor->data);
-            for (int j = 1; j < ccml_size(tensor); j++) {
-                fprintf(file_metal_ptr, ", %f", *((float *)tensor->data + j));
-            }
-            fprintf(file_metal_ptr, "]\nlet gpu_buffer_%d = device.makeBuffer(bytes: cpu_buffer_%d, "
-                    "length: %d * MemoryLayout<%s>.size, options: [])\n",
-                    i, i, ccml_size(tensor), ccml_type_swift(tensor->type));
-        }
-    }
+CCML_API void ccml_execute_graph_metal(ccml_graph * graph) {
+    // currently NO error checking lol
+    const char * kernel = ccml_kernel_metal(graph->context, graph, 0, 0, graph->n_nodes);
+    printf("the kernel is:\n%s\n", kernel);
+    @autoreleasepool {
+        NSError * error = nil;
 
-    // code specific to each i-th kernel
-    for (int i = 0; i < n_kernels; i++) {
-        ccml_kernel_metal(graph->context, graph, i, kernels[i][0], kernels[i][1]);
-        fprintf(file_metal_ptr, "\n// setting up my_kernel_%d\n"
-                "let kernelFunction_%d = library.makeFunction(name: \"my_kernel_%d\")!\n"
-                "let computePipeline_%d = try! "
-                "device.makeComputePipelineState(function: kernelFunction_%d)\n"
-                "let commandBuffer_%d = commandQueue.makeCommandBuffer()!\n"
-                "let computeEncoder_%d = commandBuffer_%d.makeComputeCommandEncoder()!\n"
-                "computeEncoder_%d.setComputePipelineState(computePipeline_%d)\n\n",
-                i, i, i, i, i, i, i, i, i, i);
-        // code specific to i-th kernel's buffers
-        int grid[CCML_DIMS_MAX] = {1, 1, 1, 1};
+        // initialise metal
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        NSString * kernel_source = [NSString stringWithUTF8String:kernel];
+        id<MTLLibrary> library = [device newLibraryWithSource:kernel_source options:nil error:&error];
+
+        // create compute function and gpu pipeline
+        id<MTLFunction> function = [library newFunctionWithName:@"my_kernel_0"];
+        id<MTLComputePipelineState> pipeline_state = [device newComputePipelineStateWithFunction:function error:&error];
+        id<MTLCommandQueue> command_queue = [device newCommandQueue];
+
+        // creating buffers
+        id<MTLBuffer> buffers[CCML_NODE_MAX];
         int n_buffers = 0;
-        for (int j = 0; j < graph->n_nodes; j++) {
-            ccml_tensor * tensor = graph->nodes[j];
-            if (ccml_has_buffer(tensor)) {
-                // selecting the largest dimensions for thread grid out of nodes
-                // that belong to i-th kernel
-                if (j >= kernels[i][0] && j <= kernels[i][1]) {
-                    grid[0] = grid[0] > tensor->shape[0] ? grid[0] : tensor->shape[0];
-                    grid[1] = grid[1] > tensor->shape[1] ? grid[1] : tensor->shape[1];
-                    grid[2] = grid[2] > tensor->shape[2] ? grid[2] : tensor->shape[2];
-                    grid[3] = grid[3] > tensor->shape[3] ? grid[3] : tensor->shape[3];
-                }
-                fprintf(file_metal_ptr, "computeEncoder_%d.setBuffer(gpu_buffer_%d, offset: 0, index: %d)\n",
-                        i, j, n_buffers++);
+        for (int i = 0; i < CCML_NODE_MAX; i++) {
+            ccml_tensor * tensor = graph->nodes[i];
+            if (tensor != NULL && ccml_has_buffer(tensor)) {
+                buffers[i] = [device newBufferWithBytes:tensor->data length:ccml_size(tensor) options:MTLResourceStorageModeShared];
             }
         }
 
-        fprintf(file_metal_ptr, "\nlet gridSize_%d = MTLSize(width: %d, height: %d, depth: %d)\n"
-                "let threadGroupSize_%d = MTLSize(width: 1, height: 1, depth: 1)\n"
-                "computeEncoder_%d.dispatchThreads(gridSize_%d, "
-                "threadsPerThreadgroup: threadGroupSize_%d)\n"
-                "computeEncoder_%d.endEncoding()\n"
-                "commandBuffer_%d.commit()\n"
-                "commandBuffer_%d.waitUntilCompleted()\n\n",
-                i, grid[0] * grid[1], grid[2], grid[3], i, i, i, i, i, i, i);
-        // copying data back from GPU to buffers (specific to i-th kernel)
-        for (int j = kernels[i][0]; j < kernels[i][1]; j++) {
-            ccml_tensor * tensor = graph->nodes[j];
-            if (ccml_has_buffer(tensor)) {
-                fprintf(file_metal_ptr, "memcpy(&cpu_buffer_%d, gpu_buffer_%d!.contents(), "
-                        "cpu_buffer_%d.count * MemoryLayout<%s>.size);\n"
-                        "print(cpu_buffer_%d)\n",
-                        j, j, j, ccml_type_swift(tensor->type), j);
+        // command buffer and compute command encoder
+        id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
+        id<MTLComputeCommandEncoder> compute_encoder = [command_buffer computeCommandEncoder];
+
+        [compute_encoder setComputePipelineState:pipeline_state];
+        int node_counter = 0;
+        for (int i = 0; i < CCML_NODE_MAX; i++) {
+            ccml_tensor * tensor = graph->nodes[i];
+            if (tensor != NULL && ccml_has_buffer(tensor)) {
+                [compute_encoder setBuffer:buffers[i] offset:0 atIndex:node_counter++];
             }
+        }
+
+        // Dispatch threads
+        MTLSize grid_size = MTLSizeMake(4, 1, 1);
+        MTLSize thread_group_size = MTLSizeMake(1, 1, 1);
+        [compute_encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
+
+        // End encoding and commit command buffer
+        [compute_encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        // Read the result
+        float * result;
+        int result_size = 0;
+        for (int i = 0; i < CCML_NODE_MAX; i++) {
+            ccml_tensor * tensor = graph->nodes[i];
+            if (tensor != NULL && tensor->oper == CCML_OPER_SAVE) {
+                result = [buffers[i] contents];
+                result_size = ccml_size(tensor);
+            }
+        }
+
+        printf("the result size is %d\n", result_size);
+
+        for (int i = 0; i < result_size; i++) {
+            printf("%f ", result[i]);
         }
     }
-
-    fclose(file_metal_ptr);
 }
+
+
+#endif /* defined(__APPLE__) */
 
 //
 //  ███████╗██╗  ██╗███████╗ ██████╗██╗   ██╗████████╗██╗ ██████╗ ███╗   ██╗
@@ -962,14 +945,11 @@ CCML_API void ccml_setup_metal(ccml_graph * graph) {
 //
 
 CCML_API void ccml_graph_execute(ccml_graph * graph) {
-    ccml_setup_metal(graph);
-
     #if defined(__APPLE__)
-        system("swiftc -o metal metal.swift -framework MetalKit && ./metal");
-        system("rm metal");
+        ccml_execute_graph_metal(graph);
+    #else
+        printf("platform not supported at the moment");
     #endif
-
-    // system("rm kernel.metal metal.swift");
 }
 
 #endif /* CCML_IMPL */
