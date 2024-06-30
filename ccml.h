@@ -1,4 +1,3 @@
-#include <OpenCL/cl.h>
 #if !defined(CCML_IMPL)
 #define CCML_IMPL
 
@@ -763,8 +762,8 @@ CCML_API const char * ccml_new_index(ccml_context * ctx, ccml_tensor * parent, c
     return index;
 }
 
-CCML_API void ccml_kernel_slice(ccml_graph * graph, int * n_kernels,
-                                int kernels[CCML_KERN_MAX][2]) {
+CCML_API void ccml_new_kernel_slice(ccml_graph * graph, int * n_kernels,
+                                    int kernels[CCML_KERN_MAX][2]) {
     kernels[*n_kernels][0] = 0;
     // not sure yet what's the optimal strategy for kernel slicing,
     // therefore for now everything is fused into a single kernel
@@ -815,7 +814,7 @@ CCML_API const char * ccml_type_metal(ccml_tensor * tensor) {
     }
 }
 
-CCML_API const char * ccml_kernel_metal(ccml_context * ctx, struct ccml_graph * graph,
+CCML_API const char * ccml_new_kernel_metal(ccml_context * ctx, struct ccml_graph * graph,
                                         int n_kernel, int start, int finish) {
     int size = CCML_CHAR_MAX * CCML_NODE_MAX * sizeof(char);
     const char * kernel = ccml_malloc(ctx, size);
@@ -912,8 +911,8 @@ CCML_API const char * ccml_kernel_metal(ccml_context * ctx, struct ccml_graph * 
 }
 
 CCML_API void ccml_execute_graph_metal(ccml_context * ctx, ccml_graph * graph) {
-    const char * kernel_source = ccml_kernel_metal(ctx, graph, 0, 0, graph->n_nodes);
-    printf("the kernel is:\n%s\n", kernel);
+    const char * kernel_source = ccml_new_kernel_metal(ctx, graph, 0, 0, graph->n_nodes);
+    printf("the kernel is:\n%s\n", kernel_source);
 
     @autoreleasepool {
         // Errors
@@ -921,7 +920,7 @@ CCML_API void ccml_execute_graph_metal(ccml_context * ctx, ccml_graph * graph) {
 
         // initialise metal
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-        NSString * kernel_source_ = [NSString stringWithUTF8String:kernel];
+        NSString * kernel_source_ = [NSString stringWithUTF8String:kernel_source];
         id<MTLLibrary> library = [device newLibraryWithSource:kernel_source_ options:nil error:&error];
         if (!library) {
             fprintf(stderr, "Failed to create MTLLibrary: %s\n", [[error localizedDescription] UTF8String]);
@@ -995,7 +994,7 @@ CCML_API void ccml_execute_graph_metal(ccml_context * ctx, ccml_graph * graph) {
 
 CCML_API const char * ccml_oper_metal(ccml_tensor *);
 CCML_API const char * ccml_type_metal(ccml_tensor *);
-CCML_API const char * ccml_kernel_metal(ccml_context *, ccml_graph *, int, int, int);
+CCML_API const char * ccml_new_kernel_metal(ccml_context *, ccml_graph *, int, int, int);
 CCML_API void ccml_execute_graph_metal(ccml_context *, ccml_graph *);
 
 #endif /* defined(__APPLE__) */
@@ -1044,7 +1043,7 @@ CCML_API const char * ccml_type_opencl(ccml_tensor * tensor) {
     }
 }
 
-CCML_API const char * ccml_kernel_opencl(ccml_context * ctx, struct ccml_graph * graph,
+CCML_API const char * ccml_new_kernel_opencl(ccml_context * ctx, struct ccml_graph * graph,
                                          int n_kernel, int start, int finish) {
     int size = CCML_CHAR_MAX * CCML_NODE_MAX * sizeof(char);
     const char * kernel = ccml_malloc(ctx, size);
@@ -1135,90 +1134,126 @@ CCML_API const char * ccml_kernel_opencl(ccml_context * ctx, struct ccml_graph *
     return kernel;
 }
 
-CCML_API void ccml_execute_graph_opencl(ccml_context * ctx, ccml_graph * graph) {
-    const char * kernel_source = ccml_kernel_opencl(ctx, graph, 0, 0, graph->n_nodes);
-    printf("the kernel is:\n%s\n", kernel_source);
+CCML_API void ccml_check_error_opencl(cl_int err, const char* operation) {
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "Error during operation '%s': %d\n", operation, err);
+        exit(1);
+    }
+}
 
+CCML_API void ccml_execute_graph_opencl(ccml_context * ctx, ccml_graph * graph) {
+    const char * kernel_source = ccml_new_kernel_opencl(ctx, graph, 0, 0, graph->n_nodes);
+    printf("kernel is: \n %s \n", kernel_source);
+
+    // get platform and device information
     cl_platform_id platform_id = NULL;
     cl_device_id device_id = NULL;
     cl_uint ret_num_devices;
     cl_uint ret_num_platforms;
-
     cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
-	ret = clGetDeviceIDs(platform_id, CL_DEVICE_TYPE_DEFAULT, 1, &device_id, &ret_num_devices);
+    ccml_check_error_opencl(ret, "clGetPlatformIDs");
 
-    cl_context context = clCreateContext(NULL, 1, &device_id, NULL, NULL,  &ret);
+    ret = clGetDeviceIDs(platform_id, CL_DEVICE_TYPE_DEFAULT, 1, &device_id, &ret_num_devices);
+    ccml_check_error_opencl(ret, "clGetDeviceIDs");
+
+    // create OpenCL context
+    cl_context context = clCreateContext(NULL, 1, &device_id, NULL, NULL, &ret);
+    ccml_check_error_opencl(ret, "clCreateContext");
+
+    // create command queue
     cl_command_queue command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+    ccml_check_error_opencl(ret, "clCreateCommandQueue");
 
+    // create memory buffers on the device for each vector and copy data inside buffers
     cl_mem buffers[CCML_NODE_MAX] = {NULL};
-    for (int i = 0; i < CCML_NODE_MAX; i++) {
+    for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
-        if (tensor != NULL && ccml_has_buffer(tensor)) {
-            if (tensor->oper == CCML_OPER_LOAD) {
-                buffers[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, ccml_size(tensor) * sizeof(float), NULL, &ret);
-            } else {
-                buffers[i] = clCreateBuffer(context, CL_MEM_WRITE_ONLY, ccml_size(tensor) * sizeof(float), NULL, &ret);
-            }
-            clEnqueueWriteBuffer(command_queue, buffers[i], CL_TRUE, 0, ccml_size(tensor) * sizeof(float), tensor->data, 0, NULL, NULL);
+        if (ccml_has_buffer(tensor) && tensor->oper != CCML_OPER_SAVE) {
+            buffers[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, ccml_size(tensor) * sizeof(float), NULL, &ret);
+            ccml_check_error_opencl(ret, "clCreateBuffer");
+
+            ret = clEnqueueWriteBuffer(command_queue, buffers[i], CL_TRUE, 0, ccml_size(tensor) * sizeof(float), tensor->data, 0, NULL, NULL);
+            ccml_check_error_opencl(ret, "clEnqueueWriteBuffer");
+        } else if (ccml_has_buffer(tensor) && tensor->oper == CCML_OPER_SAVE) {
+            buffers[i] = clCreateBuffer(context, CL_MEM_WRITE_ONLY, ccml_size(tensor) * sizeof(float), NULL, &ret);
+            ccml_check_error_opencl(ret, "clCreateBuffer");
         }
     }
 
-    cl_program program = clCreateProgramWithSource(context, 1, (const char **)&kernel_source, (const size_t *)strlen(kernel_source), &ret);
-    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
-    cl_kernel kernel = clCreateKernel(program, "my_kernel_0", &ret);
+    // Create a program from the kernel source
+    cl_program program = clCreateProgramWithSource(context, 1, &kernel_source, NULL, &ret);
+    ccml_check_error_opencl(ret, "clCreateProgramWithSource");
 
+    // Build the program
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+    if (ret != CL_SUCCESS) {
+        size_t len;
+        char buffer[2048];
+        clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, &len);
+        fprintf(stderr, "Build error: %s\n", buffer);
+        exit(1);
+    }
+
+    // Create the OpenCL kernel
+    cl_kernel kernel = clCreateKernel(program, "my_kernel_0", &ret);
+    ccml_check_error_opencl(ret, "clCreateKernel");
+
+    // Set the arguments of the kernel
     int buffer_index = 0;
     int grid[CCML_DIMS_MAX] = {1, 1, 1, 1};
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
-        if (tensor != NULL && ccml_has_buffer(tensor)) {
+        if (ccml_has_buffer(tensor)) {
             ret = clSetKernelArg(kernel, buffer_index++, sizeof(cl_mem), (void *)&buffers[i]);
+            ccml_check_error_opencl(ret, "clSetKernelArg");
         }
 
         for (int j = 0; j < CCML_DIMS_MAX; j++) {
-            if (tensor != NULL && grid[j] < tensor->shape[j]) {
-                grid[j] = tensor->shape[j];
-            }
+            if (grid[j] < tensor->shape[j]) grid[j] = tensor->shape[j];
         }
     }
 
-    size_t grid_size[3] = {grid[0] * grid[1], grid[2], grid[3]};
-    size_t thread_group_size[3] = {1, 1, 1};
-    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, grid_size, thread_group_size, 0, NULL, NULL);
+    // Execute the OpenCL kernel on the list
+    size_t global_item_size[3] = {grid[0] * grid[1], grid[2], grid[3]}; // Adjust according to your problem
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, global_item_size, NULL, 0, NULL, NULL);
+    ccml_check_error_opencl(ret, "clEnqueueNDRangeKernel");
 
-    int result_size = 1;
+    // Read the memory buffer c on the device to the local variable c
     float * result = NULL;
+    int result_size = 1;
     for (int i = 0; i < graph->n_nodes; i++) {
         ccml_tensor * tensor = graph->nodes[i];
-        if (tensor != NULL && tensor->oper == CCML_OPER_SAVE) {
-            ret = clEnqueueReadBuffer(command_queue, buffers[i], CL_TRUE, 0, ccml_size(tensor) *
-                                      sizeof(float), tensor->data, 0, NULL, NULL);
+        if (ccml_has_buffer(tensor) && tensor->oper == CCML_OPER_SAVE) {
+            ret = clEnqueueReadBuffer(command_queue, buffers[i], CL_TRUE, 0, ccml_size(tensor) * sizeof(float), tensor->data, 0, NULL, NULL);
+            ccml_check_error_opencl(ret, "clEnqueueReadBuffer");
+
             result = tensor->data;
             result_size = ccml_size(tensor);
-        }
-        if (tensor != NULL && ccml_has_buffer(tensor)) {
-            ret = clReleaseMemObject(buffers[i]);
         }
     }
 
     for (int i = 0; i < result_size; i++) {
         printf("%f ", result[i]);
     }
-    printf("\n");
 
-    ret = clFlush(command_queue);
-	ret = clFinish(command_queue);
-	ret = clReleaseCommandQueue(command_queue);
-	ret = clReleaseKernel(kernel);
-	ret = clReleaseProgram(program);
-	ret = clReleaseContext(context);
+    // Clean up
+    for (int i = 0; i < graph->n_nodes; i++) {
+        if (buffers[i] != NULL) {
+            clReleaseMemObject(buffers[i]);
+        }
+    }
+
+
+    clReleaseKernel(kernel);
+    clReleaseProgram(program);
+    clReleaseCommandQueue(command_queue);
+    clReleaseContext(context);
 }
-
 #else
 
 CCML_API const char * ccml_oper_opencl(ccml_tensor *);
 CCML_API const char * ccml_type_opencl(ccml_tensor *);
-CCML_API const char * ccml_kernel_opencl(ccml_context *, ccml_graph *, int, int, int);
+CCML_API const char * ccml_new_kernel_opencl(ccml_context *, ccml_graph *, int, int, int);
 CCML_API void ccml_execute_graph_opencl(ccml_context *, ccml_graph *);
 
 #endif /* defined CCML_BACKEND_OPENCL */

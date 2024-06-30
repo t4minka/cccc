@@ -19,6 +19,3 @@ int main() {
     // freeing the context
     ccml_context_free(ctx);
 }
-
-
-
